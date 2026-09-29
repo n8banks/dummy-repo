@@ -1,0 +1,27 @@
+# systemd unit for running the bot 24/7 on a Linux box (e.g. the home desktop).
+# Install: see deploy/install_linux.sh
+[Unit]
+Description=rhbot crypto trader
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=rhbot
+WorkingDirectory=/opt/rhbot
+# RH_API_KEY, RH_PRIVATE_KEY, and (for live) RHBOT_LIVE_ACK live here, chmod 600.
+EnvironmentFile=/etc/rhbot.env
+Environment=RHBOT_DATA=/var/lib/rhbot
+# Paper trading by default. Add --live only after weeks of paper results you trust.
+ExecStart=/opt/rhbot/.venv/bin/python -m rhbot trade --interval 1h --strategy trend
+Restart=always
+RestartSec=30
+# Hardening: the bot only needs outbound HTTPS and its own state dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rhbot
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

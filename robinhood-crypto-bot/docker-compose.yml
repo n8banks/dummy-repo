@@ -1,0 +1,12 @@
+# Works the same on Windows (Docker Desktop) and Linux.
+#   docker compose up -d --build     # start (paper trading)
+#   docker compose logs -f           # watch
+services:
+  rhbot:
+    build: .
+    restart: unless-stopped
+    env_file: .env          # RH_API_KEY / RH_PRIVATE_KEY; never commit this file
+    volumes:
+      - ./data:/data        # paper book, positions, cached candles survive restarts
+    # To go live, append --live here and set RHBOT_LIVE_ACK in .env:
+    command: ["trade", "--interval", "1h", "--strategy", "trend"]
