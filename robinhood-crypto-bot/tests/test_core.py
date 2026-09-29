@@ -97,10 +97,22 @@ class StubPaper(PaperBroker):
         return self.fixed
 
 
-def test_stop_never_more_than_5pct_below_entry():
+def test_stop_never_wider_than_cap():
     cfg = RiskConfig(stop_atr_mult=10)
     s = size_position(cfg, 10_000, 10_000, 0, 0, 100, atr_value=5, spread_pct=0.004)
-    assert s.ok and s.stop_price == pytest.approx(95.0)
+    assert s.ok and s.stop_price == pytest.approx(85.0)  # default cap 15%
+    s = size_position(RiskConfig(stop_atr_mult=10, max_stop_pct=0.05), 10_000, 10_000, 0, 0,
+                      100, atr_value=5, spread_pct=0.004)
+    assert s.stop_price == pytest.approx(95.0)
+
+
+def test_wider_stop_means_smaller_position_same_risk():
+    kw = dict(risk_per_trade=0.005, max_position_pct=1, max_exposure_pct=1, stop_atr_mult=100)
+    tight = size_position(RiskConfig(max_stop_pct=0.05, **kw), 10_000, 10_000, 0, 0, 100, 1, 0.0)
+    wide = size_position(RiskConfig(max_stop_pct=0.15, **kw), 10_000, 10_000, 0, 0, 100, 1, 0.0)
+    assert wide.notional < tight.notional
+    for s in (tight, wide):
+        assert s.quantity * (100 - s.stop_price) == pytest.approx(50)  # 0.5% of 10k either way
 
 
 def test_budget_grows_daily():
@@ -243,3 +255,36 @@ def test_cash_apy_accrues_on_idle_cash():
     res = backtest.run({"X-USD": flat(24 * 366)}, lambda: MeanReversion(), start_equity=1000,
                        cash_apy=0.05)
     assert res.equity_curve[-1][1] == pytest.approx(1050, rel=2e-3)
+
+
+def test_hold_to_profit_rules():
+    from rhbot.risk import effective_stop, exit_allowed
+
+    cfg = RiskConfig(hold_to_profit=("BTC-USD",), min_exit_profit=0.01)
+    assert effective_stop(cfg, "ETH-USD", 100, 90) == 90          # normal coin: normal stop
+    assert effective_stop(cfg, "BTC-USD", 100, 90) is None        # held coin below profit: no stop
+    assert effective_stop(cfg, "BTC-USD", 100, 105) == 105        # trailing stop locks a profit
+    assert effective_stop(RiskConfig(hold_to_profit=("BTC-USD",), hold_floor=0.4),
+                          "BTC-USD", 100, 90) == pytest.approx(60)  # disaster floor
+    assert not exit_allowed(cfg, "BTC-USD", 100, 100.5)
+    assert exit_allowed(cfg, "BTC-USD", 100, 101.5)
+    assert exit_allowed(cfg, "ETH-USD", 100, 50)
+
+
+def test_trader_hold_to_profit_does_not_sell_at_a_loss(tmp_path):
+    candles = flat(60)
+    broker = StubPaper(tmp_path, {"X-USD": Quote("X-USD", 100, 99.99, 100.01)})
+    tr = Trader(broker, ["X-USD"], lambda u: AlwaysIn, RiskConfig(hold_to_profit=("X-USD",)),
+                "1h", tmp_path / "s.json", candle_source=lambda s, i, n: candles)
+    tr.step(61 * 3600)
+    assert not broker.has_stop("X-USD")
+    broker.fixed = {"X-USD": Quote("X-USD", 50, 49.99, 50.01)}
+    assert tr.check_stops(61 * 3600 + 900) == []
+    tr.step(62 * 3600)
+    assert "X-USD" in tr.state["positions"]
+
+
+def test_backtest_contribution_cap():
+    res = backtest.run({"X-USD": flat(24 * 30)}, lambda: MeanReversion(), start_equity=0,
+                       daily_contribution=25, contribution_cap=100)
+    assert res.metrics()["contributed"] == 100

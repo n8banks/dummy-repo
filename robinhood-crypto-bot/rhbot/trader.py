@@ -30,7 +30,7 @@ from typing import Callable
 from . import data
 from .broker import Broker
 from .budget import Budget
-from .risk import CircuitBreaker, RiskConfig, size_position
+from .risk import CircuitBreaker, RiskConfig, effective_stop, exit_allowed, size_position
 from .strategies import ENTER, EXIT, Strategy
 from .util import notify, write_json_atomic
 
@@ -87,6 +87,11 @@ class Trader:
                                  "halted": b.halted, "halt_reason": b.halt_reason}
         write_json_atomic(self.state_path, self.state)
 
+    def _stop(self, sym: str, pos: dict) -> float | None:
+        """Stop to enforce now; None for a hold-to-profit position still below
+        its profit threshold and without a floor (see risk.effective_stop)."""
+        return effective_stop(self.risk, sym, pos["entry"], pos["stop"])
+
     def _close(self, sym: str, pos: dict, held_qty: float, price: float, why: str) -> str:
         qty = min(pos["qty"], held_qty)
         self.broker.sell(sym, qty)
@@ -140,11 +145,14 @@ class Trader:
         held = self.broker.holdings()
         actions = self._reconcile(quotes, held)
         for sym, pos in list(positions.items()):
-            if quotes[sym].bid <= pos["stop"]:
+            stop = self._stop(sym, pos)
+            if stop is None:
+                continue  # hold-to-profit position with no floor: nothing to enforce yet
+            if quotes[sym].bid <= stop:
                 actions.append(self._close(sym, pos, held.get(sym, 0.0), quotes[sym].bid, "stop"))
             elif not self.broker.has_stop(sym):
-                self.broker.set_stop(sym, pos["qty"], pos["stop"])
-                actions.append(f"{sym}: re-placed missing stop at {pos['stop']:.6g}")
+                self.broker.set_stop(sym, pos["qty"], stop)
+                actions.append(f"{sym}: re-placed missing stop at {stop:.6g}")
         if actions:
             self._save()
         return actions
@@ -196,16 +204,20 @@ class Trader:
                 pos["high"] = max(pos["high"], candles[i].high)
                 new_stop = max(pos["stop"], pos["high"] - self.risk.trail_atr_mult * atr_now)
                 sig = strat.signal(i, True, pos["bars"])
-                if q.bid <= pos["stop"] or sig == EXIT:
-                    why = "stop" if q.bid <= pos["stop"] else "signal"
-                    actions.append(self._close(sym, pos, held.get(sym, 0.0), q.bid, why))
+                stop = self._stop(sym, pos)
+                stop_hit = stop is not None and q.bid <= stop
+                if stop_hit or (sig == EXIT and exit_allowed(self.risk, sym, pos["entry"], q.bid)):
+                    actions.append(self._close(sym, pos, held.get(sym, 0.0), q.bid,
+                                               "stop" if stop_hit else "signal"))
                     exposure -= pos["qty"] * q.bid
                     cash += pos["qty"] * q.bid
                     continue
                 if new_stop > pos["stop"] * 1.005:
                     pos["stop"] = new_stop
-                    self.broker.set_stop(sym, pos["qty"], new_stop)
-                    actions.append(f"{sym}: trail stop -> {new_stop:.6g}")
+                    stop = self._stop(sym, pos)
+                    if stop is not None:
+                        self.broker.set_stop(sym, pos["qty"], stop)
+                        actions.append(f"{sym}: trail stop -> {stop:.6g}")
                 continue
 
             if strat.signal(i, False, 0) != ENTER or not self.breaker.can_enter(equity):
@@ -222,7 +234,9 @@ class Trader:
                                   "high": px, "ts": int(now)}
                 cash -= qty * px
                 exposure += qty * px
-                self.broker.set_stop(sym, qty, size.stop_price)
+                stop = self._stop(sym, positions[sym])
+                if stop is not None:
+                    self.broker.set_stop(sym, qty, stop)
                 msg = (f"{sym}: BUY {qty:.8g} @{px:.6g} stop {size.stop_price:.6g} "
                        f"(${qty * px:,.2f}, spread {q.spread_pct:.2%})")
                 notify(msg, "rhbot buy")

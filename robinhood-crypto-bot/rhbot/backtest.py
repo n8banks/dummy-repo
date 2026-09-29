@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .data import Candle
-from .risk import CircuitBreaker, RiskConfig, size_position
+from .risk import CircuitBreaker, RiskConfig, effective_stop, exit_allowed, size_position
 from .strategies import ENTER, EXIT, Strategy
 
 
@@ -116,11 +116,13 @@ class Result:
 def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strategy],
         risk: RiskConfig | None = None, costs: CostModel | None = None,
         start_equity: float = 10_000.0, bars_per_year: float = 24 * 365,
-        daily_contribution: float = 0.0, cash_apy: float = 0.0) -> Result:
+        daily_contribution: float = 0.0, cash_apy: float = 0.0,
+        contribution_cap: float = 0.0) -> Result:
     """`daily_contribution` adds that much cash at the first bar of each UTC
     day, like the live bot's daily allowance. `cash_apy` accrues interest on
     uninvested cash daily (e.g. Robinhood Gold's sweep rate); it counts as
-    return, not as a deposit."""
+    return, not as a deposit. `contribution_cap` stops deposits once that much
+    has gone in (0 = no cap), like the live --budget-cap."""
     risk = risk or RiskConfig()
     costs = costs or CostModel()
     strats: dict[str, Strategy] = {}
@@ -141,6 +143,7 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
     last_close: dict[str, float] = {}
     flows: list[float] = []
     day = None
+    deposited = 0.0
 
     def close_position(p: Position, mid: float, ts: int, reason: str) -> None:
         nonlocal cash
@@ -163,8 +166,11 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
             if day is not None and cash > 0:
                 cash *= (1 + cash_apy) ** ((ts // 86400 - day) / 365)
             day = ts // 86400
-            cash += daily_contribution
             flow = daily_contribution
+            if contribution_cap:
+                flow = max(0.0, min(flow, contribution_cap - deposited))
+            cash += flow
+            deposited += flow
         # 1) fills at this bar's open for last bar's signals, then stops
         for sym in list(universe):
             i = index[sym].get(ts)
@@ -173,7 +179,9 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
             bar = universe[sym][i]
             act = pending.pop(sym, None)
             if act == EXIT and sym in positions:
-                close_position(positions[sym], bar.open, ts, "signal")
+                p = positions[sym]
+                if exit_allowed(risk, sym, p.entry, costs.sell_price(sym, bar.open)):
+                    close_position(p, bar.open, ts, "signal")
             elif act == ENTER and sym not in positions and breaker.can_enter(equity()) and not breaker.halted:
                 a = strats[sym].atr[i - 1]
                 exposure = sum(p.qty * last_close.get(s, p.entry) for s, p in positions.items())
@@ -187,8 +195,9 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
 
             p = positions.get(sym)
             if p:
-                if bar.low <= p.stop:
-                    fill = min(bar.open, p.stop)  # gap through => fill at open
+                stop = effective_stop(risk, sym, p.entry, p.stop)
+                if stop is not None and bar.low <= stop:
+                    fill = min(bar.open, stop)  # gap through => fill at open
                     close_position(p, fill, ts, "stop")
                 else:
                     p.bars += 1

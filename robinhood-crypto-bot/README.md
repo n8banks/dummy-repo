@@ -30,9 +30,12 @@ A Python bot for the official **Robinhood Crypto Trading API**. It includes:
 >   bought yourself.
 > - **Diversification:** at most 10% of the pot in any one coin, and at most 8
 >   positions open at once.
-> - **Loss cap:** no trade may lose more than 5% (stop at most 5% below entry).
->   After a 3% loss in a day, stop buying for the day. After a 15% drop from the
->   peak, sell everything and stop until a human restarts it.
+> - **Loss cap:** each trade's stop sits at most 15% below entry, chosen by testing
+>   3–30% on real data. Positions are sized so that a stopped trade costs about 0.5%
+>   of the pot. Always sell losers; don't hold them hoping for a recovery (tested
+>   and rejected, see section 3). After a 3% loss in a day, stop buying for the day.
+>   After a 15% drop from the peak, sell everything and stop until a human restarts
+>   it.
 > - **Evidence:** backtest on **real** historical data with realistic costs. Compare
 >   against buy-and-hold. Check that results hold across different settings and
 >   years, not just one lucky combination.
@@ -82,37 +85,98 @@ off so the full period is visible.
 | hourly trend (v1) | −12% before halt | −2.7 | tripped kill switch in 2022 | | | | |
 | 4-hour momentum | −10.6% | −0.45 | 48% | −18% | −3% | −3% | −24% |
 | daily trend + regime | 2.7% | 0.31 | 14% | −1% | +6% | +21% | −7% |
-| **daily momentum + regime (default)** | **4.7%** | **0.33** | **34%** | **−4%** | **+16%** | **+31%** | **−16%** |
-| same, with a 10% loss cap | 4.4% | 0.43 | 20% | −3% | +16% | +18% | −8% |
+| daily momentum + regime, 5% loss cap | 4.7% | 0.33 | 34% | −4% | +16% | +31% | −16% |
+| daily momentum + regime, 10% loss cap | 4.4% | 0.43 | 20% | −3% | +16% | +18% | −8% |
+| **daily momentum + regime, 15% loss cap (default)** | **4.6%** | **0.52** | **15%** | **−3%** | **+14%** | **+18%** | **−6%** |
 | buy & hold, equal weight | −1.7% | 0.30 | 73% | −73% | +125% | +126% | −21% |
 | buy & hold, BTC only | 12.8% | 0.49 | 67% | −65% | +156% | +121% | −6% |
 
 (CAGR = average yearly growth. Sharpe = return per unit of risk; higher is better.
 "Regime" = only buy while BTC is above its 100-day average.)
 
-**Robustness checks:**
-- 68 of 72 settings for daily momentum + regime made money (typical: +4.9%/yr).
-- All 27 settings for daily trend + regime made money (+2–4%/yr).
+**Robustness checks (15% cap):**
+- **All 72** settings for daily momentum + regime made money, in a tight range of
+  +2.2% to +6.8%/yr (typical: +4.2%). With the 5% cap it was 68 of 72, spread from
+  −1.8% to +11.9%.
+- All 27 settings for daily trend + regime made money (+1.9% to +2.6%/yr).
 - The default is a middle-of-the-range setting, not the best backtest. Picking the
   best one mostly picks luck.
 
 **Spread sensitivity** (daily momentum + regime):
 
-| Round-trip spread | Yearly return |
-|---|---|
-| 0.2% | +11.5% |
-| 0.4% | +9.0% |
-| 0.8% | +4.7% |
-| 1.2% | +0.5% |
-| 1.6% | −3.5% |
+| Round-trip spread | Yearly return, 15% cap | Yearly return, old 5% cap |
+|---|---|---|
+| 0.2% | +6.7% | +11.5% |
+| 0.4% | +6.0% | +9.0% |
+| 0.8% | +4.6% | +4.7% |
+| 1.2% | +3.4% | +0.5% |
+| 1.6% | +2.2% | −3.5% |
 
-**$25/day since 2022:** $27.6k deposited grew to $37.5k (+11.8%/yr on the money
-deposited) before the 15% kill switch tripped in 2025.
+The wider cap gives up some upside at very low spreads. In exchange, it survives
+spreads that erased the 5% version, because fewer false stop-outs mean paying the
+spread less often.
 
-**$500 lump sum:** results swing a lot depending on timing:
-- 5% loss cap: tripped the kill switch in 2023 at −$55.
-- 5% cap plus 4% interest on idle cash: +8.9%/yr until a halt in 2024.
-- 10% loss cap plus interest: +8.2%/yr, a 14% worst drop, and no halt.
+**Your plan with the defaults** (15% cap, kill switch on, 4% interest on idle cash):
+- **$500 from Jan 2022:** grew to **$735** by Sep 2026. That's +8.5%/yr, a 10.7%
+  worst drop, and no halt. Yearly: +1%, +18%, +22%, −2.5%, +3.7%. About 2 points
+  a year of that is cash interest.
+- **$25/day with no cap:** $43.3k deposited grew to $52.9k, with no halt.
+- **$25/day up to $500, started on 15 different dates from 2022 to 2025:** the
+  typical run gained **+44%** by Sep 2026. The worst start lost 2.5%, 1 of 15
+  starts lost money, and none tripped the kill switch.
+
+### Choosing the loss cap
+
+Each cap was tested on 2022–2024, then checked on 2025–2026 data the choice never
+saw. It had to hold for both strategies.
+
+| Cap | Momentum CAGR / Sharpe / worst drop | 2022–24 Sharpe | 2025–26 Sharpe (unseen) | Breakout Sharpe |
+|---|---|---|---|---|
+| 3% | 0.2% / 0.11 / 38% | 0.46 | −0.64 | 0.17 |
+| 5% | 4.7% / 0.33 / 34% | 0.70 | −0.48 | 0.31 |
+| 7.5% | 4.1% / 0.35 / 25% | 0.72 | −0.44 | **0.42** |
+| 10% | 4.4% / 0.43 / 20% | 0.80 | −0.38 | 0.36 |
+| 12.5% | 4.3% / 0.47 / 17% | 0.85 | −0.38 | 0.39 |
+| **15%** | **4.6% / 0.52 / 15%** | **0.91** | **−0.34** | **0.38** |
+| 20% | 4.8% / 0.56 / 13% | 0.94 | −0.27 | 0.37 |
+| 30% or none | 4.9% / 0.58 / 12% | 0.98 | −0.26 | 0.37 |
+
+**15% is the choice.**
+- Wider caps improve steadily up to about 15%, then level off. Past that, the
+  volatility-based stop (2.5× the average daily move) takes over.
+- The improvement shows up in both the training years and the unseen years, so
+  it isn't curve-fitting.
+- Going past 15% adds very little, and it makes the worst single gap-through
+  crash bigger.
+- The breakout strategy is flat from 7.5% up, so 15% is safe for it too.
+
+Two things to be clear about:
+- **A wider stop doesn't mean a bigger loss.** Position size shrinks as the stop
+  widens, so a stopped-out trade still costs about 0.5% of the pot.
+- **Every cap lost money in 2025–26.** That was a choppy, falling market. The best
+  caps lost the least, but none made money in it.
+
+### Hold until profitable? Tested, and no.
+
+Same $500 plan, 15 start dates. "Hold" means never sell below entry +1%.
+
+| Variant | Typical result | Worst start | Kill switch tripped | Positions stuck up to |
+|---|---|---|---|---|
+| **15% cap, sell losers (default)** | **+44%** | **−2.5%** | **0/15** | 55 days |
+| hold BTC & ETH | +31% | −13% | 13/15 | 685 days |
+| hold BTC & ETH, but sell at −40% | +31% | −13% | 13/15 | 258 days |
+| hold every coin | +37% | −14% | 15/15 | 685 days |
+
+Holding raised the win rate from 30% to 67%, which feels better, while returns fell.
+Losing positions tie up money for up to two years, so it can't go into new trades.
+- At the end of the test, BTC was still −14% from where it was bought, and ETH −20%.
+  ETH was below its Jan 2022 price even in Sep 2026, so "it always comes back"
+  can take years, or not happen at all.
+- Underwater holdings also drag the pot down 15%, and then the kill switch sells
+  them anyway, at the worst time.
+
+It's available as `--hold-to-profit BTC-USD ETH-USD [--hold-floor 0.4]` if you want
+to try it on paper, but I don't recommend it.
 
 ---
 
@@ -125,11 +189,12 @@ These are the problems that matter, not every nitpick.
    and 0.8% spreads, and the 4-hour version lost 7–11% a year. "1000 small
    trades" only works where trading costs about 0.1%, not 0.8%. The bot now trades
    daily: about 90 trades a year across 7 coins.
-2. **The edge that survives is thin.** It's about +5% a year at a 0.8% spread, and
-   it disappears around 1.2%. It **did not beat simply holding BTC** on either return
-   or risk-adjusted return. What it does well is avoid crashes: it lost 4% in 2022
-   while the coins fell 65–73%. If the spreads you actually pay are near 1%, there's
-   no edge.
+2. **The edge that survives is modest.** It's about +4.6% a year at a 0.8% spread
+   (+2% at 1.6%). It **earns less than holding BTC** (12.8%/yr), but with about a
+   quarter of the worst drop (15% vs 67%), so it wins on risk-adjusted return. It
+   lost 3% in 2022 while the coins fell 65–73%. It also lost money in 2025–26:
+   trend following earns its keep in big moves and bleeds a little in choppy
+   markets.
 3. **The backtest flatters itself in known ways:**
    - it's one 4¾-year history,
    - the prices are Binance's, not Robinhood's,
@@ -139,13 +204,12 @@ These are the problems that matter, not every nitpick.
    - it covers 7 of the 10 coins.
 
    Expect live results to be worse than the backtest.
-4. **Your 5% loss rule has a measurable cost.** Crypto routinely moves 5% in a day,
-   so tight stops sell at the bottom of normal swings and buy back higher. In every
-   test, a 10% cap had better risk-adjusted returns and smaller worst drops. The
-   15% kill switch also trips in a normal bad year, which means pausing and
-   reviewing, not a disaster. Both are your call (`--max-loss`, see section 7).
+4. **Tight stops were a mistake, and they're fixed.** Crypto routinely moves 5% in
+   a day, so the original 5% stop sold at the bottom of normal swings and bought
+   back higher. The cap is now 15%, chosen by the sweep in section 3. Holding
+   losers until they recover was also tested and rejected.
 5. **The live code is unproven.** Order handling follows a third-party client of
-   Robinhood's spec, and I couldn't test it against the real API. Paper mode and 25
+   Robinhood's spec, and I couldn't test it against the real API. Paper mode and 29
    unit tests cover the logic, not the real endpoint.
 6. **The screener is heuristic.** Its weights are judgment calls, and its "out of
    sample" check is too short to mean much. Use it to spot bad coins, like ones
@@ -185,14 +249,15 @@ the biggest single improvement available. That would take a new broker module.
 
 Not at this size, and it's worth being blunt about that:
 
-- **$500 at about 5% a year is about $25 a year.** Even a great year (+30%) is $150.
+- **$500 at about 5–8% a year is about $25–40 a year.** A great year like 2024
+  (+22%) is about $110.
 - **Most of the growth comes from your deposits.** $25/day is about $9,000 a year.
   The trading adds a few percent on top. The deposit habit is the real wealth
   builder.
 - **Idle cash earns interest.** The bot is in cash about half the time. With
   Robinhood Gold, uninvested cash earns the sweep rate (check the current rate in
-  the app). That's real, low-risk return, and at 4% it doubled the $500 backtest's
-  yearly return. Use `backtest --cash-apy 0.04` to see it with your rate.
+  the app). That's real, low-risk return: at 4%, it added about 2 points a
+  year in the $500 backtest. Use `backtest --cash-apy 0.04` to see it with your rate.
 - **Treat the first 3–6 months as an experiment, not income.** The goal is to find
   out whether the edge survives Robinhood's real spreads. If it does, scale up
   slowly. If it doesn't, you've lost a capped, known amount.
@@ -207,7 +272,7 @@ rhbot/
   data.py        Coinbase candles, CSV cache, resampling, synthetic data
   indicators.py  EMA/SMA/ATR/RSI/Donchian/volatility/correlation
   strategies.py  TSMomentum (default), TrendBreakout, MeanReversion, RegimeFilter
-  risk.py        sizing, 5% loss cap, exposure caps, circuit breakers
+  risk.py        sizing, 15% stop cap, hold-to-profit option, exposure caps, circuit breakers
   budget.py      $25/day allowance with a cap
   backtest.py    portfolio backtester (spread, fees, gaps, deposits, cash interest)
   research.py    variant comparison vs buy & hold, per-year returns
@@ -224,13 +289,16 @@ average. It sells when 2 or fewer say "up", or when the trailing stop is hit.
 
 **Risk defaults:**
 - 0.5% of the pot at risk per trade.
-- Stop at 2.5×ATR or 5% below entry, whichever is closer. Trailing stop at 3×ATR.
+- Stop at 2.5×ATR or 15% below entry, whichever is closer. Trailing stop at 3×ATR.
+  A stopped-out trade costs about 0.5% of the pot, however wide the stop is.
 - At most 10% of the pot per coin, 70% invested in total, 8 positions.
 - Stop buying for the day after a 3% daily loss. After a 15% drop from the peak,
   sell everything and halt.
 
 **Change these to your preference:**
-- `--max-loss 0.10` loosens the per-trade cap (see section 4).
+- `--max-loss 0.10` tightens the stop cap (see section 3 for how each value tested).
+- `--hold-to-profit BTC-USD ETH-USD` never sells those coins at a loss (tested worse,
+  see section 3).
 - `--no-regime` turns off the BTC filter.
 - `--strategy trend` is the calmer, lower-return option.
 

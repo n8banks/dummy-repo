@@ -1,14 +1,14 @@
 """Risk management. Every entry, in backtest and live, goes through here.
 
-Loss cap: every position's stop is at most `max_stop_pct` (5%) below the
-price paid, so no single trade is allowed to lose more than that. The one
-exception is a price gap straight through the stop (a crash between checks),
-where the sell fills at the first available price.
+Loss cap: every position's stop is at most `max_stop_pct` (15%) below the
+price paid. The one exception is a price gap straight through the stop (a
+crash between checks), where the sell fills at the first available price.
 
 Sizing rule (fixed-fractional risk): pick a stop distance from volatility
-(k * ATR, capped at 5%), then size the position so that hitting the stop loses at most
-`risk_per_trade` of equity, including the spread paid. Then clamp by the
-per-position cap, total exposure cap and available cash.
+(k * ATR, capped at 15%), then size the position so that hitting the stop
+loses at most `risk_per_trade` (0.5%) of equity, including the spread paid.
+A wider stop therefore means a smaller position, not a bigger loss. Then
+clamp by the per-position cap, total exposure cap and available cash.
 
 Circuit breakers: stop opening new positions after the day's loss exceeds
 `max_daily_loss`, and stop everything after equity falls `max_drawdown`
@@ -24,7 +24,8 @@ from dataclasses import dataclass, field
 class RiskConfig:
     risk_per_trade: float = 0.005   # lose at most 0.5% of equity per stopped-out trade
     stop_atr_mult: float = 2.5      # stop distance = 2.5 * ATR ...
-    max_stop_pct: float = 0.05      # ... but never more than 5% below the entry price
+    max_stop_pct: float = 0.15      # ... but never more than 15% below the entry price
+                                    # (swept 3%-30% on real data; see README section 4)
     take_profit_r: float = 0.0      # 0 = no fixed target; exits come from trailing stop / signal
     trail_atr_mult: float = 3.0     # trailing stop distance once in profit
     max_position_pct: float = 0.10  # no single coin above 10% of equity: many small bets
@@ -34,6 +35,28 @@ class RiskConfig:
     max_drawdown: float = 0.15      # hard stop at -15% from peak equity
     min_order_usd: float = 1.0      # Robinhood has no per-order fee, so small orders are fine
     max_cost_to_stop: float = 0.35  # skip if round-trip spread eats >35% of the stop distance
+    # "Hold until profitable": for these symbols a position is never sold below
+    # entry * (1 + min_exit_profit), except when it falls `hold_floor` below entry
+    # (0 = no floor at all) or the drawdown kill switch fires.
+    hold_to_profit: tuple = ()
+    min_exit_profit: float = 0.01
+    hold_floor: float = 0.0
+
+
+def effective_stop(cfg: RiskConfig, symbol: str, entry: float, stop: float) -> float | None:
+    """The stop that should actually be enforced (and placed at the broker).
+    Normal symbols: the position's stop. Hold-to-profit symbols: the trailing
+    stop once it locks in a profit, else the disaster floor, else nothing."""
+    if symbol not in cfg.hold_to_profit:
+        return stop
+    if stop >= entry * (1 + cfg.min_exit_profit):
+        return stop
+    return entry * (1 - cfg.hold_floor) if cfg.hold_floor else None
+
+
+def exit_allowed(cfg: RiskConfig, symbol: str, entry: float, price: float) -> bool:
+    """May a strategy (signal) exit sell at `price`?"""
+    return symbol not in cfg.hold_to_profit or price >= entry * (1 + cfg.min_exit_profit)
 
 
 @dataclass

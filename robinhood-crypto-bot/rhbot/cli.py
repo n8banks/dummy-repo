@@ -74,7 +74,8 @@ def _builder(args):
 
 
 def _risk(args) -> RiskConfig:
-    return RiskConfig(max_stop_pct=args.max_loss)
+    return RiskConfig(max_stop_pct=args.max_loss, hold_to_profit=tuple(args.hold_to_profit),
+                      hold_floor=args.hold_floor)
 
 
 def _bars_per_year(interval: str) -> float:
@@ -215,8 +216,13 @@ def main(argv=None):
         sp.add_argument("--strategy", default="tsmom", choices=list(STRATEGIES))
         sp.add_argument("--no-regime", action="store_true",
                         help="don't require BTC to be in an uptrend before buying")
-        sp.add_argument("--max-loss", type=float, default=0.05,
-                        help="hard cap on loss per trade (0.05 = 5%%)")
+        sp.add_argument("--max-loss", type=float, default=0.15,
+                        help="widest stop, as a fraction below entry (0.15 = 15%%). Positions are "
+                             "sized so a stopped trade still loses ~0.5%% of the pot")
+        sp.add_argument("--hold-to-profit", nargs="*", default=[], metavar="SYMBOL",
+                        help="never sell these below a small profit (tested: worse; see README)")
+        sp.add_argument("--hold-floor", type=float, default=0.0,
+                        help="with --hold-to-profit, still sell if down this much (0.4 = 40%%)")
         sp.add_argument("--spread", type=float, default=0.008,
                         help="assumed round-trip spread when no live quote (0.008 = 0.8%%)")
         sp.add_argument("--fee", type=float, default=0.0, help="explicit per-side fee fraction")
