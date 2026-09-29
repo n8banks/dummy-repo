@@ -157,6 +157,50 @@ The same plan with a rule to never sell below entry gave:
 It's still available as `--hold-to-profit BTC-USD ETH-USD`, but I don't recommend
 it.
 
+### Experiment: evolving the strategy (neuroevolution)
+
+`python -m rhbot evolve` breeds small neural "brains", the way simulated
+creatures are evolved to walk. Each brain sees 9 features built only from past
+prices: momentum over 5 lookbacks, the volatility regime, the drawdown from the
+recent high, and BTC's trend. From those it scores whether to hold each coin.
+The brains trade inside the normal backtester and risk rules (costs, stops,
+sizing, kill switch), so they only decide *when* to hold a coin.
+
+Three safeguards against memorising history:
+1. **Domain randomisation:** every generation gets a random cost (1.5–2.5%) and a
+   random subset of coins. This is the robotics trick that makes simulated
+   walkers work in the real world.
+2. **Consistency fitness:** it rewards the average yearly result and penalises
+   swings between years, so a brain can't win on one lucky year.
+3. **A null control:** the identical evolution is run on price histories with the
+   daily returns shuffled in time. That removes any trend but keeps the
+   volatility. The real champion has to clearly beat those champions.
+
+**Result.** Brains were evolved on 2018–2023: 3 real runs and 5 null runs, 48
+brains × 40 generations each. They were then tested once on Jan 2024–Sep 2026.
+
+| | Training fitness | Holdout at Robinhood's 2% | Holdout at 0.8% (Kraken-like) |
+|---|---|---|---|
+| Hand-built momentum | +0.017 | −0.8%/yr | +2.4%/yr |
+| Evolved #1 / #2 / #3 | +0.047 / +0.064 / +0.052 | +0.5% / +3.1% / −0.2% | +3.4% / +7.3% / +4.0% |
+| Committee of the 3 | — | −0.6%/yr | +2.8%/yr |
+| Null (scrambled) champions | ≤ +0.013 (mostly learned "don't trade") | ~0% | — |
+| Buy & hold BTC | — | about +28%/yr (+98% total) | — |
+
+**What this shows:**
+- **Evolution found real structure, not noise.** The real champions scored 4–5×
+  higher than the best null champion.
+- **All three evolved brains beat the hand-built strategy on unseen data**, at both
+  cost levels. The margins are small, though, and the period is short. Picking #2
+  because it did best here would be peeking; the committee is the honest choice,
+  and it performs about the same as the hand-built rules.
+- **Evolution doesn't fix the cost problem.** At Robinhood's price, the best honest
+  outcome was roughly flat for 2024–26. At 0.8% costs, every variant made money.
+
+It's worth re-running `evolve` on your desktop as new data arrives, and
+paper-trading a PASS champion (`--strategy evolved`) alongside the default. The
+`trade` command refuses to run a brain that failed its null or holdout test.
+
 ---
 
 ## 4. Independent review (three separate reviewers)
@@ -193,7 +237,7 @@ fixed and covered by fake-exchange tests in `tests/test_live.py`:
 | One error could skip the day's stop checks | Errors are caught per coin, and stop checks run even when the daily cycle fails |
 | Two running copies could both trade | A lock allows only one copy at a time |
 
-42 tests pass. Paper trading can't produce lost responses or partial fills, so
+47 tests pass. Paper trading can't produce lost responses or partial fills, so
 those paths are tested only against the fake exchange.
 
 **3. Cost research.** This established the ~2% round-trip cost above. The same
@@ -237,6 +281,7 @@ rhbot/
   backtest.py    portfolio backtest: spread, fees, stop slippage, gaps,
                  deposits, cash interest
   research.py    variant comparison vs buy & hold, per-year returns
+  evolve.py      neuroevolution with domain randomisation + null control
   data.py, indicators.py, screener.py, util.py
 ```
 
@@ -261,6 +306,7 @@ pip install -r requirements.txt
 
 python -m rhbot fetch                        # ~5 years of daily candles from Coinbase
 python -m rhbot research                     # strategy comparison vs buy & hold
+python -m rhbot evolve                       # evolve a neural policy (~10 min, 4 cores)
 python -m rhbot backtest --daily-budget 25   # defaults: 2% cost + 0.5% stop slippage
 python -m rhbot backtest --equity 500 --spread 0.008   # what a cheaper venue would do
 python -m rhbot screen                       # live Robinhood spreads once keys are set
