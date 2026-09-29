@@ -39,12 +39,26 @@ def test_sizing_respects_caps_and_spread_veto():
 
 
 def test_circuit_breaker():
+    day = 86400
     b = CircuitBreaker(RiskConfig(max_daily_loss=0.03, max_drawdown=0.1))
     b.update(0, 100)
-    assert b.can_enter(98)
-    assert not b.can_enter(96)
-    b.update(10, 89)
-    assert b.halted and not b.can_enter(200)
+    b.update(day, 98)
+    assert b.can_enter()          # -2% vs a day ago
+    b.update(2 * day, 94)
+    assert not b.can_enter()      # -4% vs a day ago (checked once a day still works)
+    b.update(3 * day, 89)
+    assert b.halted and not b.can_enter()
+    b.reset()
+    assert b.can_enter() or not b.halted
+
+
+def test_circuit_breaker_ignores_deposits():
+    b = CircuitBreaker(RiskConfig(max_drawdown=0.15))
+    b.update(0, 100, contributed=100)
+    b.update(86400, 190, contributed=200)   # +100 deposit, -10 trading loss
+    assert b.index == pytest.approx(0.9)
+    b.update(2 * 86400, 270, contributed=300)  # another deposit hides nothing
+    assert b.halted
 
 
 class AlwaysIn(Strategy):
@@ -92,9 +106,8 @@ class StubPaper(PaperBroker):
         super().__init__(tmp / "book.json", 10_000)
         self.fixed = quotes
 
-    def quotes(self, symbols):
-        self._last.update(self.fixed)
-        return self.fixed
+    def _fetch_quotes(self, symbols):
+        return dict(self.fixed)
 
 
 def test_stop_never_wider_than_cap():
@@ -145,12 +158,13 @@ def test_trader_paper_cycle_enters_then_stops_out(tmp_path):
     now = 61 * 3600
     acts = tr.step(now)
     assert any("BUY" in a for a in acts)
-    assert broker.holdings()["X-USD"] > 0
+    assert broker.book["holdings"]["X-USD"] > 0
+    assert tr.state["positions"]["X-USD"]["stop_id"]  # protective stop resting
     stop = tr.state["positions"]["X-USD"]["stop"]
     broker.fixed = {"X-USD": Quote("X-USD", stop * 0.99, stop * 0.98, stop)}
     acts = tr.step(now + 3600)
-    assert any("SELL" in a and "stop" in a for a in acts)
-    assert not broker.holdings()
+    assert any("SOLD" in a and "stop" in a for a in acts)
+    assert broker.book["holdings"]["X-USD"] == pytest.approx(0)
     assert tr.state["realized_pnl"] < 0 and tr.state["trades"] == 1
 
 
@@ -168,7 +182,7 @@ def test_trader_respects_budget_and_leaves_user_coins(tmp_path):
     assert pos["qty"] * pos["entry"] <= 25 * RiskConfig().max_position_pct + 1e-6
     broker.fixed = {"X-USD": Quote("X-USD", 90, 89.99, 90.01)}
     tr.step(now + 3600)
-    assert broker.holdings()["X-USD"] == pytest.approx(5.0)  # only the bot's slice was sold
+    assert broker.book["holdings"]["X-USD"] == pytest.approx(5.0)  # only the bot's slice was sold
 
 
 def test_budget_cap():
@@ -238,7 +252,7 @@ def test_check_stops_between_bars(tmp_path):
     stop = tr.state["positions"]["X-USD"]["stop"]
     broker.fixed = {"X-USD": Quote("X-USD", stop, stop * 0.999, stop * 1.001)}
     acts = tr.check_stops(61 * 3600 + 1800)
-    assert any("SELL" in a for a in acts) and not tr.state["positions"]
+    assert any("SOLD" in a for a in acts) and not tr.state["positions"]
 
 
 def test_build_strategies_scale_with_interval():
@@ -277,7 +291,7 @@ def test_trader_hold_to_profit_does_not_sell_at_a_loss(tmp_path):
     tr = Trader(broker, ["X-USD"], lambda u: AlwaysIn, RiskConfig(hold_to_profit=("X-USD",)),
                 "1h", tmp_path / "s.json", candle_source=lambda s, i, n: candles)
     tr.step(61 * 3600)
-    assert not broker.has_stop("X-USD")
+    assert tr.state["positions"]["X-USD"]["stop_id"] is None
     broker.fixed = {"X-USD": Quote("X-USD", 50, 49.99, 50.01)}
     assert tr.check_stops(61 * 3600 + 900) == []
     tr.step(62 * 3600)

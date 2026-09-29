@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import requests
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -140,31 +140,44 @@ class RobinhoodClient:
             path = f"{path}?{urlencode(list(params))}"
         # Serialize once: the signed bytes must be exactly the sent bytes.
         payload = json.dumps(body, separators=(",", ":")) if body is not None else ""
-        for attempt in range(4):
+        # Only reads are retried. A POST that timed out or got a 5xx may still
+        # have been executed, so retrying could place the same order twice; the
+        # caller reconciles by client_order_id instead (see broker.find).
+        attempts = 4 if method.upper() == "GET" else 1
+        for attempt in range(attempts):
             self.bucket.acquire()
             headers = self.signer.headers(method, path, payload)
-            resp = self.http.request(
-                method, self.base_url + path, headers=headers,
-                data=payload or None, timeout=self.timeout,
-            )
-            if resp.status_code == 429 or resp.status_code >= 500:
+            try:
+                resp = self.http.request(
+                    method, self.base_url + path, headers=headers,
+                    data=payload or None, timeout=self.timeout,
+                )
+            except requests.RequestException as e:
+                if attempt + 1 == attempts:
+                    raise RobinhoodError(0, f"network error: {e!r}") from e
+                time.sleep(2 ** attempt)
+                continue
+            if (resp.status_code == 429 or resp.status_code >= 500) and attempt + 1 < attempts:
                 time.sleep(2 ** attempt)
                 continue
             if resp.status_code >= 400:
                 raise RobinhoodError(resp.status_code, resp.text)
             return resp.json() if resp.text else None
-        raise RobinhoodError(resp.status_code, resp.text)
+        raise AssertionError("unreachable")
 
-    def _paginate(self, path: str, params: list[tuple[str, Any]] | None = None) -> list[dict]:
+    def _paginate(self, path: str, params: list[tuple[str, Any]] | None = None,
+                  max_pages: int = 50) -> list[dict]:
         out: list[dict] = []
         page = self.request("GET", path, params)
-        while True:
+        for _ in range(max_pages):
             out.extend(page.get("results", []))
             nxt = page.get("next")
             if not nxt:
-                return out
+                break
             # `next` is an absolute URL; re-sign using its path + query.
-            page = self.request("GET", nxt.replace(self.base_url, ""))
+            u = urlsplit(nxt)
+            page = self.request("GET", u.path + (f"?{u.query}" if u.query else ""))
+        return out
 
     # -- account / market data --------------------------------------------
 
@@ -213,6 +226,11 @@ class RobinhoodClient:
     def open_orders(self, symbol: str | None = None) -> list[dict]:
         params = [("state", "open")] + ([("symbol", symbol)] if symbol else [])
         return self._paginate(ORDERS, params)
+
+    def recent_orders(self, symbol: str | None = None, pages: int = 3) -> list[dict]:
+        """Most recent orders (newest first), for matching a client_order_id
+        after a request whose outcome is unknown."""
+        return self._paginate(ORDERS, [("symbol", symbol)] if symbol else None, max_pages=pages)
 
     def cancel_order(self, order_id: str) -> Any:
         return self.request("POST", f"{ORDERS}{order_id}/cancel/")

@@ -1,361 +1,310 @@
-# rhbot: a risk-managed crypto trader for Robinhood
+# rhbot: a risk-managed crypto trend follower for Robinhood
 
 A Python bot for the official **Robinhood Crypto Trading API**. It includes:
 
-- a coin screener,
-- a backtester that charges realistic costs,
-- a research harness that compares strategies against buy-and-hold,
+- a daily trend-following strategy with a BTC "market regime" filter,
+- a strict budget ledger,
+- stop-loss orders that rest at Robinhood (native stops),
+- a backtester and research harness that charge realistic costs,
 - a paper trader (the default),
 - a live trader behind two explicit safety switches.
 
-> **Read this first.** On real 2022–2026 prices, the first version of this bot lost
-> money. That version traded hourly and aimed for "1000 small trades". The version
-> here trades daily, sits out bear markets, and made a small profit in testing. But
-> it's a thin edge, not a money machine. Only risk money you can lose. Nothing here
-> is financial advice.
+> **Bottom line, after independent review:** this is a real but **thin** edge at
+> Robinhood's prices.
+> - On 2018–2021 data that no setting was chosen on, it made about +18%/yr with a
+>   ~9% worst drop.
+> - From 2022 to 2026, at Robinhood's real ~2% round-trip cost, it roughly broke
+>   even.
+>
+> Its strength is sitting out crashes, not beating buy-and-hold. Only risk money you
+> can lose. None of this is financial advice.
 
 ---
 
 ## 1. The spec (your prompt, improved)
 
-> Build a Python trading system for the **official Robinhood Crypto Trading API**
-> (Ed25519-signed requests to `trading.robinhood.com`). It trades liquid, mainstream
-> spot crypto: BTC, ETH, SOL, XRP, DOGE, ADA, AVAX, LINK, LTC and BCH, against USD.
+> Build a Python trading system for the **official Robinhood Crypto Trading API**.
+> It trades liquid, mainstream spot crypto (BTC, ETH, SOL, XRP, DOGE, ADA, AVAX,
+> LINK, LTC, BCH vs USD).
 >
-> - **Goal:** grow a small, regularly topped-up pot by taking many small,
->   cost-aware trades. Only take a trade when the expected move clearly beats
->   Robinhood's spread.
-> - **Budget:** $25 per day of new capital, capped at $500 to start. The bot
->   compounds its own profits and never spends other account cash or sells coins you
->   bought yourself.
-> - **Diversification:** at most 10% of the pot in any one coin, and at most 8
->   positions open at once.
-> - **Loss cap:** each trade's stop sits at most 15% below entry, chosen by testing
->   3–30% on real data. Positions are sized so that a stopped trade costs about 0.5%
->   of the pot. Always sell losers; don't hold them hoping for a recovery (tested
->   and rejected, see section 3). After a 3% loss in a day, stop buying for the day.
->   After a 15% drop from the peak, sell everything and stop until a human restarts
->   it.
-> - **Evidence:** backtest on **real** historical data with realistic costs. Compare
->   against buy-and-hold. Check that results hold across different settings and
->   years, not just one lucky combination.
-> - **Operations:** paper trading by default. Live trading needs explicit opt-in.
->   Restarts are safe. Stop-loss orders rest at Robinhood so crashes are covered even
->   if the bot is down. Runs 24/7 on a home desktop, with phone alerts.
-> - **Deadline:** running by Friday.
+> - **Goal:** grow a small, regularly topped-up pot through many small, cost-aware
+>   trades.
+> - **Budget:** $25/day of new capital, capped at $500 to start. The bot compounds
+>   its profits and never spends other account cash or touches coins or orders you
+>   own yourself.
+> - **Diversification:** at most 10% of the pot per coin and 8 positions.
+> - **Loss control:**
+>   - Stop at most 15% below entry, with each trade sized so a stop-out costs
+>     about 0.5% of the pot.
+>   - Always sell losers.
+>   - After a 3% daily loss, pause new buys.
+>   - After a 20% drawdown, sell everything and halt until a human resets it.
+> - **Evidence:** real historical data, realistic costs (spread, fees, stop
+>   slippage), comparison with buy-and-hold, and data held back that no setting
+>   was chosen on.
+> - **Operations:**
+>   - Paper trading by default; live needs explicit opt-in.
+>   - Crash-safe: every order is recorded before it's sent, and state is saved
+>     after every fill.
+>   - Runs 24/7 on a home desktop with phone alerts.
 
 ---
 
-## 2. Research: the Robinhood Crypto Trading API
+## 2. Robinhood API and real costs
 
 | | |
 |---|---|
-| **Base URL** | `https://trading.robinhood.com` |
-| **Auth** | Headers `x-api-key`, `x-timestamp` (unix seconds, valid ~30 s) and `x-signature`. The signature is Ed25519 over `api_key + timestamp + path_with_query + METHOD + body`, using a base64 32-byte seed as the private key. |
-| **Rate limit** | 100 requests/minute, bursting to 300 |
-| **Endpoints (v1)** | `trading/accounts/`, `trading/trading_pairs/`, `trading/holdings/`, `trading/orders/` (plus `{id}/cancel/`), `marketdata/best_bid_ask/`, `marketdata/estimated_price/` |
-| **Order types** | `market` (asset quantity only), `limit`, `stop_loss`, `stop_limit` |
-| **Quotes** | Include `bid_inclusive_of_sell_spread` / `ask_inclusive_of_buy_spread`, which are the prices you actually get. The bot measures costs from these. |
-| **Not available** | Price history, shorting, leverage, derivatives, websockets |
+| **Base URL** | `https://trading.robinhood.com`. There's no sandbox, so testing means real orders. |
+| **Auth** | Headers `x-api-key`, `x-timestamp` and `x-signature`. The signature is Ed25519 over `api_key + timestamp + path_with_query + METHOD + body`, using a base64 32-byte seed as the private key. Timestamps expire after about 30 s. |
+| **Rate limit** | 100 requests/min, bursting to 300 |
+| **Endpoints** | `trading/{accounts,trading_pairs,holdings,orders}/`, `orders/{id}/cancel/`, `marketdata/{best_bid_ask,estimated_price}/` |
+| **Orders** | `market` (asset quantity only), `limit`, `stop_loss` (becomes a market order when triggered), `stop_limit`. `time_in_force` is gtc, gfd, gfw or gfm. |
+| **Not available** | Price history (candles come from Coinbase), shorting, leverage |
 
-Robinhood's own docs site was unreachable from the build environment. The details
-above come from an open-source client that implements Robinhood's published spec
-([nirholas/robinhood-mcp](https://github.com/nirholas/robinhood-mcp)). **The live
-order code has never been run against the real API.** Your first `trade --once`
-with keys is its first real test.
+**What it really costs.** There are two ways to pay, and at small size they cost
+about the same:
+- **API v1:** no fee, but Robinhood takes about $0.95 per $100 through the spread
+  on each side.
+- **API v2:** an explicit fee of about 0.95% per side at the lowest volume tier,
+  on a near-zero spread.
 
-**Costs are the whole game.** There's no commission, but a spread is built into
-your price: roughly **0.35–0.85% for BTC/ETH**, wider for smaller coins and during
-volatile moves. So a buy plus a sell costs about **0.7–1.7%**.
-([Robinhood fee tiers](https://robinhood.com/us/en/support/articles/crypto-fee-tiers),
-[Bitget: RH spreads 2026](https://www.bitget.com/academy/robinhood-crypto-trading-spreads-explained-2026-america-beginners-guide-costs-features-new-tools))
+That's **about 1.9–2% per round trip.** The backtests default to 2% plus 0.5%
+slippage on stop fills.
+
+Robinhood's docs were blocked from the build environment. These details come from a
+third-party copy of the published spec and from open-source clients:
+- [spec copy](https://github.com/mvanhorn/printing-press-library/blob/HEAD/library/payments/robinhood/spec.json)
+- [keel](https://github.com/CodeGateSoftware/keel)
+- [nirholas/robinhood-mcp](https://github.com/nirholas/robinhood-mcp)
+- [RH order routing](https://robinhood.com/us/en/support/articles/crypto-order-routing/)
+- [RH fee tiers](https://robinhood.com/us/en/support/articles/crypto-fee-tiers)
+
+**The live code has never been run against the real API**, so your first order is
+its first real test.
 
 ---
 
-## 3. What real data says
+## 3. Evidence
 
-Backtests used real hourly candles from **Jan 2022 to Sep 2026** for BTC, ETH, SOL,
-XRP, DOGE, ADA and BCH. The data is Binance's, via the public-domain
-[Speirsy11/crypto-dataset](https://github.com/Speirsy11/crypto-dataset). Every test
-charges a 0.8% round-trip spread, starts with $10k, and has the kill switch turned
-off so the full period is visible.
+**Data:** real daily candles, Aug 2017 to Sep 2026, from Binance via the
+public-domain [Speirsy11/crypto-dataset](https://github.com/Speirsy11/crypto-dataset).
+Coins: BTC, ETH, SOL, XRP, DOGE, ADA, BCH.
 
-| Variant | CAGR | Sharpe | Worst drop | 2022 | 2023 | 2024 | 2025 |
-|---|---|---|---|---|---|---|---|
-| hourly trend (v1) | −12% before halt | −2.7 | tripped kill switch in 2022 | | | | |
-| 4-hour momentum | −10.6% | −0.45 | 48% | −18% | −3% | −3% | −24% |
-| daily trend + regime | 2.7% | 0.31 | 14% | −1% | +6% | +21% | −7% |
-| daily momentum + regime, 5% loss cap | 4.7% | 0.33 | 34% | −4% | +16% | +31% | −16% |
-| daily momentum + regime, 10% loss cap | 4.4% | 0.43 | 20% | −3% | +16% | +18% | −8% |
-| **daily momentum + regime, 15% loss cap (default)** | **4.6%** | **0.52** | **15%** | **−3%** | **+14%** | **+18%** | **−6%** |
-| buy & hold, equal weight | −1.7% | 0.30 | 73% | −73% | +125% | +126% | −21% |
-| buy & hold, BTC only | 12.8% | 0.49 | 67% | −65% | +156% | +121% | −6% |
+**Default strategy:** momentum with regime filter, 15% stop cap, 0.5% risk per
+trade. Costs: 2% round trip plus 0.5% stop slippage. The kill switch is off in
+these tables so the full history is visible.
+
+| Period | CAGR | Sharpe | Worst drop | Trades/yr |
+|---|---|---|---|---|
+| **2018–2021** (unseen; no setting was chosen on it) | **+18.0%** | **1.27** | 9.4% | 56 |
+| 2022–Sep 2026 | +0.6% | 0.12 | 18.3% | 59 |
+| **2018–Sep 2026** | **+8.2%** | **0.75** | 18.3% | 58 |
+| Buy & hold BTC, 2018–2026 | +23.5% | 0.65 | 81% | — |
+| Buy & hold ETH, 2018–2026 | +15.6% | 0.60 | 94% | — |
 
 (CAGR = average yearly growth. Sharpe = return per unit of risk; higher is better.
 "Regime" = only buy while BTC is above its 100-day average.)
 
-**Robustness checks (15% cap):**
-- **All 72** settings for daily momentum + regime made money, in a tight range of
-  +2.2% to +6.8%/yr (typical: +4.2%). With the 5% cap it was 68 of 72, spread from
-  −1.8% to +11.9%.
-- All 27 settings for daily trend + regime made money (+1.9% to +2.6%/yr).
-- The default is a middle-of-the-range setting, not the best backtest. Picking the
-  best one mostly picks luck.
+**What it does well:** it avoided the 2018 and 2022 crashes (−1% and −3% while
+coins fell 65–83%) and caught the 2020–21 and 2023–24 trends.
 
-**Spread sensitivity** (daily momentum + regime):
+**What it does badly:** it bleeds slowly in choppy markets, and at 2% per round
+trip that bleed ate all of 2022–26's gains.
 
-| Round-trip spread | Yearly return, 15% cap | Yearly return, old 5% cap |
-|---|---|---|
-| 0.2% | +6.7% | +11.5% |
-| 0.4% | +6.0% | +9.0% |
-| 0.8% | +4.6% | +4.7% |
-| 1.2% | +3.4% | +0.5% |
-| 1.6% | +2.2% | −3.5% |
+**Your plan, simulated:** $25/day up to $500, 20% kill switch, starting from each of
+24 dates between 2018 and 2025, measured to Sep 2026:
 
-The wider cap gives up some upside at very low spreads. In exchange, it survives
-spreads that erased the 5% version, because fewer false stop-outs mean paying the
-spread less often.
-
-**Your plan with the defaults** (15% cap, kill switch on, 4% interest on idle cash):
-- **$500 from Jan 2022:** grew to **$735** by Sep 2026. That's +8.5%/yr, a 10.7%
-  worst drop, and no halt. Yearly: +1%, +18%, +22%, −2.5%, +3.7%. About 2 points
-  a year of that is cash interest.
-- **$25/day with no cap:** $43.3k deposited grew to $52.9k, with no halt.
-- **$25/day up to $500, started on 15 different dates from 2022 to 2025:** the
-  typical run gained **+44%** by Sep 2026. The worst start lost 2.5%, 1 of 15
-  starts lost money, and none tripped the kill switch.
-
-### Choosing the loss cap
-
-Each cap was tested on 2022–2024, then checked on 2025–2026 data the choice never
-saw. It had to hold for both strategies.
-
-| Cap | Momentum CAGR / Sharpe / worst drop | 2022–24 Sharpe | 2025–26 Sharpe (unseen) | Breakout Sharpe |
+| Venue (cost) | Median | Worst start | Best start | Losing starts |
 |---|---|---|---|---|
-| 3% | 0.2% / 0.11 / 38% | 0.46 | −0.64 | 0.17 |
-| 5% | 4.7% / 0.33 / 34% | 0.70 | −0.48 | 0.31 |
-| 7.5% | 4.1% / 0.35 / 25% | 0.72 | −0.44 | **0.42** |
-| 10% | 4.4% / 0.43 / 20% | 0.80 | −0.38 | 0.36 |
-| 12.5% | 4.3% / 0.47 / 17% | 0.85 | −0.38 | 0.39 |
-| **15%** | **4.6% / 0.52 / 15%** | **0.91** | **−0.34** | **0.38** |
-| 20% | 4.8% / 0.56 / 13% | 0.94 | −0.27 | 0.37 |
-| 30% or none | 4.9% / 0.58 / 12% | 0.98 | −0.26 | 0.37 |
+| Robinhood (~2%) | **+2.4%/yr** | −8.3%/yr | +11.3%/yr | 5/24 |
+| Kraken Pro-like (~0.8%) | **+6.3%/yr** | −6.0%/yr | +16.3%/yr | 4/24 |
 
-**15% is the choice.**
-- Wider caps improve steadily up to about 15%, then level off. Past that, the
-  volatility-based stop (2.5× the average daily move) takes over.
-- The improvement shows up in both the training years and the unseen years, so
-  it isn't curve-fitting.
-- Going past 15% adds very little, and it makes the worst single gap-through
-  crash bigger.
-- The breakout strategy is flat from 7.5% up, so 15% is safe for it too.
+The 24 starts share much of the same history, so they aren't 24 independent
+trials.
 
-Two things to be clear about:
-- **A wider stop doesn't mean a bigger loss.** Position size shrinks as the stop
-  widens, so a stopped-out trade still costs about 0.5% of the pot.
-- **Every cap lost money in 2025–26.** That was a choppy, falling market. The best
-  caps lost the least, but none made money in it.
+### How the settings were chosen
 
-### Hold until profitable? Tested, and no.
+- **Daily bars, not hourly.** Hourly and 4-hour versions lost 7–12%/yr on real
+  data even at 0.8% costs. Frequent trading just pays the spread more often.
+- **Regime filter.** Blocking buys while BTC is below its 100-day average cut
+  2022's loss from −9% to −3%. When the audit shifted the signal a day *later*,
+  results got worse, and a day *earlier* (a deliberate peek at the future) they got
+  better. That's the pattern expected when the filter isn't secretly using future
+  data.
+- **15% stop cap.** Tested from 3% to 30% on 2022–24, checked on 2025–26 and again
+  on 2018–21. 15–20% is a plateau.
+  - Tight stops (3–5%) whipsaw: they sell on normal swings and buy back higher.
+  - Position size shrinks as the stop widens, so the cap mostly works as a size
+    dial. Per-trade risk stays at about 0.5% of the pot.
+- **Stickier exits.** The bot sells only when at most 1 of 5 lookbacks still says
+  "up". That means fewer round trips, and it was equal or better in every period
+  at 2% costs.
+- **20% kill switch.** A 15% switch halted almost every simulation during the same
+  normal 2025 drawdown (about −15 to −18%). 20% still catches a broken strategy.
+- **Risk per trade 0.5%.** Raising it to 0.75% adds about half again to returns, but
+  it deepened 2022–26's worst drop from 15% to 22%. It's a reasonable growth
+  setting only after live results justify it.
 
-Same $500 plan, 15 start dates. "Hold" means never sell below entry +1%.
+### Rejected: "hold BTC/ETH until profitable"
 
-| Variant | Typical result | Worst start | Kill switch tripped | Positions stuck up to |
-|---|---|---|---|---|
-| **15% cap, sell losers (default)** | **+44%** | **−2.5%** | **0/15** | 55 days |
-| hold BTC & ETH | +31% | −13% | 13/15 | 685 days |
-| hold BTC & ETH, but sell at −40% | +31% | −13% | 13/15 | 258 days |
-| hold every coin | +37% | −14% | 15/15 | 685 days |
+The same plan with a rule to never sell below entry gave:
+- lower returns,
+- a win rate of 67% instead of about 30%, which *felt* better but made less money,
+- positions stuck underwater for up to 685 days (ETH was still below its Jan 2022
+  price in Sep 2026),
+- a kill switch that fired anyway, selling at the worst moment.
 
-Holding raised the win rate from 30% to 67%, which feels better, while returns fell.
-Losing positions tie up money for up to two years, so it can't go into new trades.
-- At the end of the test, BTC was still −14% from where it was bought, and ETH −20%.
-  ETH was below its Jan 2022 price even in Sep 2026, so "it always comes back"
-  can take years, or not happen at all.
-- Underwater holdings also drag the pot down 15%, and then the kill switch sells
-  them anyway, at the worst time.
-
-It's available as `--hold-to-profit BTC-USD ETH-USD [--hold-floor 0.4]` if you want
-to try it on paper, but I don't recommend it.
+It's still available as `--hold-to-profit BTC-USD ETH-USD`, but I don't recommend
+it.
 
 ---
 
-## 4. Honest review of this project
+## 4. Independent review (three separate reviewers)
 
-These are the problems that matter, not every nitpick.
+**1. Backtest audit.** It tried to break the backtester and found **no look-ahead
+bug**.
+- Accounting reconciles to the cent.
+- Random entries with the same exits never matched the strategy in 30 tries.
+- Zero-trend synthetic data produces no profit, so the code doesn't invent an edge.
 
-1. **The original idea fails on Robinhood's costs.** Frequent small trades pay
-   the spread every time. On real data the hourly version lost money at both 0.4%
-   and 0.8% spreads, and the 4-hour version lost 7–11% a year. "1000 small
-   trades" only works where trading costs about 0.1%, not 0.8%. The bot now trades
-   daily: about 90 trades a year across 7 coins.
-2. **The edge that survives is modest.** It's about +4.6% a year at a 0.8% spread
-   (+2% at 1.6%). It **earns less than holding BTC** (12.8%/yr), but with about a
-   quarter of the worst drop (15% vs 67%), so it wins on risk-adjusted return. It
-   lost 3% in 2022 while the coins fell 65–73%. It also lost money in 2025–26:
-   trend following earns its keep in big moves and bleeds a little in choppy
-   markets.
-3. **The backtest flatters itself in known ways:**
-   - it's one 4¾-year history,
-   - the prices are Binance's, not Robinhood's,
-   - the coins were chosen in 2026, so none of them blew up (no LUNA or FTT),
-   - it assumes a fixed spread, but real spreads widen in crashes, exactly when
-     stops fire,
-   - it covers 7 of the 10 coins.
+It did find optimism, all now fixed or disclosed:
+- Stops used to fill exactly at the stop price; there's now 0.5% slippage.
+- Deposits hid drawdowns; drawdown is now measured on a deposit-adjusted index,
+  in both the backtest and the live kill switch.
+- The daily-loss pause never fired on daily bars; it now compares against about
+  24 hours earlier.
+- The cash-interest boost was overstated; see section 5.
+- Settings were chosen on 2022–26 data; hence the separate 2018–21 test.
+- Survivorship: the coins were picked in 2026, and Robinhood reportedly delisted
+  SOL and ADA in 2023 (unverified). Using only BTC, ETH, DOGE and BCH gives about
+  +4.7%/yr for 2018–26.
 
-   Expect live results to be worse than the backtest.
-4. **Tight stops were a mistake, and they're fixed.** Crypto routinely moves 5% in
-   a day, so the original 5% stop sold at the bottom of normal swings and bought
-   back higher. The cap is now 15%, chosen by the sweep in section 3. Holding
-   losers until they recover was also tested and rejected.
-5. **The live code is unproven.** Order handling follows a third-party client of
-   Robinhood's spec, and I couldn't test it against the real API. Paper mode and 29
-   unit tests cover the logic, not the real endpoint.
-6. **The screener is heuristic.** Its weights are judgment calls, and its "out of
-   sample" check is too short to mean much. Use it to spot bad coins, like ones
-   whose spread is too wide for their typical moves. Don't use it to pick winners.
+**2. Live-code review (two rounds).** It found real money-losing bugs. All are now
+fixed and covered by fake-exchange tests in `tests/test_live.py`:
 
-**What's solid:**
-- the signed API client,
-- honest cost accounting: next-bar fills, gap-through stops, deposits not counted
-  as profit,
-- the budget ledger, which never spends outside money or sells your own coins,
-- stops that rest at Robinhood,
-- crash-safe state files,
-- the research harness that exposed all of the above.
+| Bug | Fix |
+|---|---|
+| It could sell coins you own yourself after a native stop filled, or when an order's response was lost or slow | The bot tracks only its own quantity and order IDs, and nothing new is placed for a coin while an earlier order's outcome is unknown |
+| Moving a stop could leave the position unprotected (cancels settle asynchronously) | It waits for the cancel to settle; if the stop filled first, it books that fill; if a new stop can't be placed, it restores protection or closes |
+| A lost response could place a second order or lose track of a fill | Order requests are never auto-retried; every order is recorded before it's sent and matched by its ID afterwards, and a resting stop found this way is adopted, not duplicated |
+| Partly filled stops could be booked twice | Only the newly filled quantity is booked |
+| State was saved only once per cycle | It's saved after every fill, together with clearing the order record |
+| It cancelled or adopted your own open orders | It no longer touches orders it didn't place |
+| One error could skip the day's stop checks | Errors are caught per coin, and stop checks run even when the daily cycle fails |
+| Two running copies could both trade | A lock allows only one copy at a time |
+
+42 tests pass. Paper trading can't produce lost responses or partial fills, so
+those paths are tested only against the fake exchange.
+
+**3. Cost research.** This established the ~2% round-trip cost above. The same
+strategy on Kraken Pro (0.25% maker / 0.40% taker, with native stop orders) roughly
+**2.5× the median return** in the plan simulation.
 
 ---
 
-## 5. How this compares to other crypto strategies
+## 5. Is this an income stream?
 
-| Approach | Used by | Workable here? |
-|---|---|---|
-| Market making / high-frequency trading | Firms with exchange connectivity and fee rebates | **No.** Robinhood routes orders to market makers, so you can't post quotes. |
-| Funding-rate / basis arbitrage (buy spot, short futures, earn the funding payments) | Hedge funds, advanced retail on derivatives exchanges | **No.** This API has no futures or perpetuals. It's the most consistent crypto yield, but it needs a derivatives venue. |
-| Cross-sectional momentum (rank many coins, hold the strongest) | Quant funds; documented in academic research | **Partly.** It needs 30+ coins to work; 7–10 is too few. |
-| **Trend / time-series momentum, sized by volatility** | CTAs and trend funds; the strongest-documented crypto effect (e.g. Liu & Tsyvinski, *Risks and Returns of Cryptocurrency*, 2021) | **Yes. This is what rhbot now does**, long-only, with a BTC regime filter. |
-| Grid bots | Popular retail bots | **Poorly.** They profit in ranges and lose in trends, and Robinhood's spread forces grid lines far apart. |
-| "AI"/sentiment bots | Marketing | Mostly overfitted to past data. No edge anyone has shown after costs. |
-| Regular buying (DCA) plus a trend filter | Passive investors | **Yes, and simpler.** It's close to what the budget ledger plus regime filter already does. |
+Not at this size, and it's worth being blunt:
 
-So rhbot uses the right tool for Robinhood's constraints. **Robinhood is simply an
-expensive venue to trade actively on.** The same strategy at a 0.2–0.4% spread made
-+9–11% a year. If this experiment proves out, running it on a lower-cost exchange is
-the biggest single improvement available. That would take a new broker module.
-
----
-
-## 6. Is this an income stream?
-
-Not at this size, and it's worth being blunt about that:
-
-- **$500 at about 5–8% a year is about $25–40 a year.** A great year like 2024
-  (+22%) is about $110.
-- **Most of the growth comes from your deposits.** $25/day is about $9,000 a year.
-  The trading adds a few percent on top. The deposit habit is the real wealth
-  builder.
-- **Idle cash earns interest.** The bot is in cash about half the time. With
-  Robinhood Gold, uninvested cash earns the sweep rate (check the current rate in
-  the app). That's real, low-risk return: at 4%, it added about 2 points a
-  year in the $500 backtest. Use `backtest --cash-apy 0.04` to see it with your rate.
-- **Treat the first 3–6 months as an experiment, not income.** The goal is to find
-  out whether the edge survives Robinhood's real spreads. If it does, scale up
-  slowly. If it doesn't, you've lost a capped, known amount.
+- **$500 at about 2–6% a year is about $10–30 a year.** Even the best simulated
+  start (+11%/yr) is about $55 a year.
+- **The deposits are the wealth builder.** $25/day is about $9,000 a year.
+- **Robinhood Gold's cash sweep (3.6% APY as of Sep 2026) earns more, more
+  reliably, than the trading does at this size.** The bot holds cash about 85% of
+  the time, so that cash keeps earning while it waits. The interest is paid to
+  your account, not counted in the bot's ledger. At $500, Gold's $5/month fee
+  costs more than the interest; since you already have Gold, it's a free bonus.
+- **If you want the edge to matter, the lever is cost, not tuning.** A Kraken
+  broker module (0.5–0.8% round trip) is the highest-value next build.
+- Other low-effort yield on Robinhood: ETH/SOL staking (from $1; Robinhood keeps
+  25% of rewards; not offered in every state).
 
 ---
 
-## 7. How it works
+## 6. How it works
 
 ```
 rhbot/
-  robinhood.py   signed API client, rate limiter, order-body builder
-  data.py        Coinbase candles, CSV cache, resampling, synthetic data
-  indicators.py  EMA/SMA/ATR/RSI/Donchian/volatility/correlation
+  robinhood.py   signed API client (reads retried, orders never), rate limiter
+  broker.py      PaperBroker (simulated exchange) / RobinhoodBroker: every order
+                 by client_order_id, polled until done; native stop-loss orders
+  trader.py      daily decision loop + stop check every 15 minutes; write-ahead
+                 order log, reconciliation, per-fill saves, phone alerts
+  risk.py        sizing, 15% stop cap, deposit-adjusted circuit breakers,
+                 hold-to-profit option
   strategies.py  TSMomentum (default), TrendBreakout, MeanReversion, RegimeFilter
-  risk.py        sizing, 15% stop cap, hold-to-profit option, exposure caps, circuit breakers
   budget.py      $25/day allowance with a cap
-  backtest.py    portfolio backtester (spread, fees, gaps, deposits, cash interest)
+  backtest.py    portfolio backtest: spread, fees, stop slippage, gaps,
+                 deposits, cash interest
   research.py    variant comparison vs buy & hold, per-year returns
-  screener.py    coin ranking
-  broker.py      PaperBroker / RobinhoodBroker (limit entries, native stop-loss orders)
-  trader.py      daily decision loop plus a stop check every 15 minutes, phone alerts
-  util.py        crash-safe JSON writes, ntfy notifications
+  data.py, indicators.py, screener.py, util.py
 ```
 
-**Strategy (default `tsmom` with the regime filter, on daily bars):** each coin gets a
-vote from 5 lookbacks: is the price higher than it was 7, 14, 30, 60 and 90 days
-ago? The bot buys when at least 4 of 5 say "up" **and** BTC is above its 100-day
-average. It sells when 2 or fewer say "up", or when the trailing stop is hit.
+**Strategy:** each coin gets a vote from 5 lookbacks: is it higher than it was 7,
+14, 30, 60 and 90 days ago?
+- **Buy** when at least 4 of 5 say "up" **and** BTC is above its 100-day average.
+- **Sell** when at most 1 of 5 still says "up", or when the trailing stop is hit.
 
 **Risk defaults:**
-- 0.5% of the pot at risk per trade.
-- Stop at 2.5×ATR or 15% below entry, whichever is closer. Trailing stop at 3×ATR.
-  A stopped-out trade costs about 0.5% of the pot, however wide the stop is.
-- At most 10% of the pot per coin, 70% invested in total, 8 positions.
-- Stop buying for the day after a 3% daily loss. After a 15% drop from the peak,
-  sell everything and halt.
-
-**Change these to your preference:**
-- `--max-loss 0.10` tightens the stop cap (see section 3 for how each value tested).
-- `--hold-to-profit BTC-USD ETH-USD` never sells those coins at a loss (tested worse,
-  see section 3).
-- `--no-regime` turns off the BTC filter.
-- `--strategy trend` is the calmer, lower-return option.
+- Stop at 2.5×ATR (ATR is the average daily price range) or 15% below entry,
+  whichever is closer. Trailing stop at 3×ATR.
+- Each trade sized so a stop-out costs about 0.5% of the pot.
+- At most 10% per coin, 70% invested in total, 8 positions.
+- Pause new buys after a 3% daily loss; halt at a 20% drawdown.
 
 ---
 
-## 8. Usage
+## 7. Usage
 
 ```bash
 pip install -r requirements.txt
 
 python -m rhbot fetch                        # ~5 years of daily candles from Coinbase
-python -m rhbot research                     # strategy comparison table, like section 3
-python -m rhbot backtest --daily-budget 25 --cash-apy 0.04
-python -m rhbot backtest --equity 500 --spread 0.012          # stress test: wider spread
-python -m rhbot screen                       # uses live Robinhood spreads once keys are set
+python -m rhbot research                     # strategy comparison vs buy & hold
+python -m rhbot backtest --daily-budget 25   # defaults: 2% cost + 0.5% stop slippage
+python -m rhbot backtest --equity 500 --spread 0.008   # what a cheaper venue would do
+python -m rhbot screen                       # live Robinhood spreads once keys are set
 
 python -m rhbot keygen                       # key pair for Robinhood API access
-python -m rhbot trade --once                 # one paper cycle: prints what it would do
+python -m rhbot trade --once                 # one paper cycle
 python -m rhbot trade                        # paper trade continuously
 python -m rhbot status                       # pot, positions, stops, realized P&L
 ```
 
-Trading defaults: `--interval 1d --strategy tsmom --daily-budget 25 --budget-cap 500`.
+**Going live** requires `RHBOT_LIVE_ACK="I understand this trades real money"` in
+the environment **and** the `--live` flag.
 
-**Going live** needs both of these:
-
-```bash
-export RHBOT_LIVE_ACK="I understand this trades real money"
-python -m rhbot trade --live
-```
-
-**API keys:** run `keygen`. Register the **public** key in Robinhood under
-**Account → Crypto → API Trading**, and put the API key it gives you plus your
-**private** key in the env file on your desktop. Never paste them into a chat, a
-commit or a screenshot.
+**API keys:** register the **public** key from `keygen` in Robinhood (Account →
+Crypto → API Trading). Put the API key it gives you, plus your private key, only in
+the env file on your desktop. Never paste them into a chat, a commit or a
+screenshot.
 
 ---
 
-## 9. Plan for Friday
+## 8. Plan
 
-1. **Wed:** set up the desktop (section 10). Run `fetch`, `research` and
-   `backtest --daily-budget 25` there. These use Coinbase data up to today, which
-   is a fresh check on this document's numbers.
-2. **Wed:** create your keys and start **paper** trading
-   (`systemctl enable --now rhbot`). Check that `trade --once` and `status` make
-   sense, and that the spreads `screen` reports are near 0.8%. If they're above
-   about 1.1%, there's no edge. Don't go live.
-3. **Fri:** fund with $500, add `--live`, and keep `--daily-budget 25
-   --budget-cap 500`. The first live order is also the first real test of the order
-   code. Watch it in the Robinhood app.
-4. **After ~100 closed trades (months, not weeks):** compare against the backtest.
-   Stop if it's down more than 10%, or if it's losing more than it wins in dollars
-   (profit factor below 1).
+1. **Set up the desktop** (section 9). Run `fetch`, `research` and
+   `backtest --daily-budget 25` there, on up-to-date Coinbase data.
+2. **Paper trade** (the default) and check `status` against what you'd expect.
+3. **Run `screen` with keys set** to see the costs you actually pay.
+   - If the round trip is well above 2%, don't go live.
+   - Consider the v2 API (explicit fees, counts toward volume tiers).
+4. **Supervised live trial:**
+   - Fund $500 and add `--live`.
+   - The first orders are the first real test of the order code, so watch them in
+     the app.
+   - Check that every buy gets a stop order.
+   - Act on any "uncertain" or "error" phone alert.
+   - For the first weeks, keep coins you hold yourself out of this account.
+5. **Judge it after about 100 closed trades,** which takes about 1.5 years at ~60
+   trades a year.
+   - Stop if it's down more than 10%, or if losses exceed gains in dollars.
+   - Expect it to lag buy-and-hold in bull markets. That's the price of sitting out
+     crashes.
 
 ---
 
-## 10. Running it on your home desktop
+## 9. Running it on your home desktop
 
 The bot uses almost no CPU. It needs to **stay up** and **keep accurate time**.
 
@@ -367,21 +316,23 @@ The bot uses almost no CPU. It needs to **stay up** and **keep accurate time**.
 
 **Machine checklist:**
 - **Power:** turn off sleep. Set BIOS "Restore on AC power loss" to **On**.
-- **Clock:** keep time sync on. Robinhood rejects requests more than ~30 seconds off.
-- **Network:** a wired connection is best. The bot only makes outbound connections,
-  so don't open router ports.
+- **Clock:** keep time sync on. Robinhood rejects requests more than ~30 s off.
+- **Network:** wired is best. The bot only makes outbound connections, so don't
+  open router ports.
 - **Phone alerts:** install the **ntfy** app, subscribe to a long random topic name,
-  and set `RHBOT_NTFY_TOPIC` to that name. You'll get buys, sells, halts, errors and
-  a daily summary.
-- **If the PC goes down:** live positions keep their stop orders at Robinhood. When
-  the bot restarts, it adopts them, and it re-places any stop that's missing.
+  and set `RHBOT_NTFY_TOPIC` to it. You'll get buys, sells, halts, errors and a
+  daily summary.
+- **If the PC goes down:** native stops keep protecting positions at Robinhood. On
+  restart, the bot polls its own stop orders and books any fills. Only one copy
+  can run at a time.
 - **Secrets:** keep the env file `chmod 600`. Never commit it.
 
 ---
 
-## 11. Next steps
+## 10. Next steps
 
-- A lower-cost exchange broker module. That's the biggest lever, by far.
-- Read the actual fee tier from API v2 into the cost model.
-- Walk-forward re-testing on your live fills after 3 months.
-- More coins, which would make cross-sectional momentum possible.
+- **A Kraken Pro broker module.** It cuts costs 2.5–4×, which is the biggest lever
+  by far.
+- API v2 support, with your real fee tier fed into the cost model.
+- More coins. Research suggests trend following works best with about 10–15 coins.
+- After 3 months of live data, compare real fills with the backtest.

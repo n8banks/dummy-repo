@@ -41,3 +41,24 @@ def notify(message: str, title: str = "rhbot", priority: str = "default") -> Non
                       headers={"Title": title, "Priority": priority}, timeout=10)
     except Exception:
         log.warning("notification failed", exc_info=True)
+
+
+def single_instance(path: str | Path):
+    """Hold an exclusive lock on `path` for the life of the process, so two
+    copies of the bot can never trade the same account at once. Returns the
+    open file (keep a reference); exits if another copy holds the lock."""
+    import sys
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(f"another rhbot is already running (lock held on {path})")
+    return f

@@ -21,8 +21,9 @@ from .strategies import ENTER, EXIT, Strategy
 
 @dataclass
 class CostModel:
-    spread_pct: float = 0.008   # round-trip, e.g. 0.8% => 0.4% each side
+    spread_pct: float = 0.02    # round-trip, e.g. 2% => 1% each side (Robinhood, small size, 2026)
     fee_pct: float = 0.0        # explicit per-side fee, if any
+    stop_slippage: float = 0.0  # stop-market fills this much below the stop price
     per_symbol_spread: dict[str, float] = field(default_factory=dict)
 
     def spread(self, symbol: str) -> float:
@@ -86,10 +87,13 @@ class Result:
         mean = sum(rets) / len(rets)
         sd = math.sqrt(sum((r - mean) ** 2 for r in rets) / max(1, len(rets) - 1))
         downside = math.sqrt(sum(min(r, 0) ** 2 for r in rets) / len(rets))
-        peak, mdd = eq[0], 0.0
-        for e in eq:
-            peak = max(peak, e)
-            mdd = max(mdd, 1 - e / peak)
+        # Drawdown on the deposit-adjusted (time-weighted) index, so new money
+        # coming in can't hide a losing stretch.
+        idx, peak, mdd = 1.0, 1.0, 0.0
+        for r in rets:
+            idx *= 1 + r
+            peak = max(peak, idx)
+            mdd = max(mdd, 1 - idx / peak)
         years = len(rets) / self.bars_per_year
         wins = [t for t in self.trades if t.pnl > 0]
         losses = [t for t in self.trades if t.pnl <= 0]
@@ -182,7 +186,7 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
                 p = positions[sym]
                 if exit_allowed(risk, sym, p.entry, costs.sell_price(sym, bar.open)):
                     close_position(p, bar.open, ts, "signal")
-            elif act == ENTER and sym not in positions and breaker.can_enter(equity()) and not breaker.halted:
+            elif act == ENTER and sym not in positions and breaker.can_enter():
                 a = strats[sym].atr[i - 1]
                 exposure = sum(p.qty * last_close.get(s, p.entry) for s, p in positions.items())
                 px = costs.buy_price(sym, bar.open)
@@ -197,7 +201,8 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
             if p:
                 stop = effective_stop(risk, sym, p.entry, p.stop)
                 if stop is not None and bar.low <= stop:
-                    fill = min(bar.open, stop)  # gap through => fill at open
+                    # gap through => fill at open; stop-market orders also slip
+                    fill = min(bar.open, stop) * (1 - costs.stop_slippage)
                     close_position(p, fill, ts, "stop")
                 else:
                     p.bars += 1
@@ -205,6 +210,7 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
                     a = strats[sym].atr[i]
                     if a and risk.trail_atr_mult:
                         p.stop = max(p.stop, p.high_water - risk.trail_atr_mult * a)
+                    a = strats[sym].atr[i - 1]  # target known before this bar traded
                     if risk.take_profit_r and a:
                         target = p.entry + risk.take_profit_r * risk.stop_atr_mult * a
                         if bar.high >= target:
@@ -213,7 +219,7 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
 
         # 2) mark to market, circuit breakers
         eq = equity()
-        breaker.update(ts, eq)
+        breaker.update(ts, eq, deposited)
         curve.append((ts, eq))
         flows.append(flow)
         if breaker.halted:

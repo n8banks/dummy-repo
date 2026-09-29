@@ -179,8 +179,10 @@ def build(name: str, bar_seconds: int, btc: list[Candle] | None = None,
     per_day = max(1, 86400 // bar_seconds)
     d = lambda days: max(2, int(days * per_day))  # noqa: E731
     if name == "tsmom":
+        # exit_at 0.2: hold until at most 1 of 5 lookbacks is still up. Fewer
+        # round trips, which matters at Robinhood's ~2% cost per round trip.
         base = lambda: TSMomentum(lookbacks=(d(7), d(14), d(30), d(60), d(90)),  # noqa: E731
-                                  enter_at=0.8, exit_at=0.4)
+                                  enter_at=0.8, exit_at=0.2)
     elif name == "trend":
         base = lambda: TrendBreakout(entry_n=d(20), exit_n=d(10), fast=d(20), slow=d(50))  # noqa: E731
     elif name == "meanrev":

@@ -11,7 +11,7 @@ A wider stop therefore means a smaller position, not a bigger loss. Then
 clamp by the per-position cap, total exposure cap and available cash.
 
 Circuit breakers: stop opening new positions after the day's loss exceeds
-`max_daily_loss`, and stop everything after equity falls `max_drawdown`
+`max_daily_loss`, and stop everything after equity falls `max_drawdown` (20%)
 below its peak. Both require a human to restart.
 """
 
@@ -32,7 +32,8 @@ class RiskConfig:
     max_exposure_pct: float = 0.70  # at most 70% of equity in crypto at once
     max_positions: int = 8
     max_daily_loss: float = 0.03    # pause new entries for the day after -3%
-    max_drawdown: float = 0.15      # hard stop at -15% from peak equity
+    max_drawdown: float = 0.20      # hard stop at -20% from peak (15% tripped on the
+                                    # one normal bad stretch in 2018-2026 data)
     min_order_usd: float = 1.0      # Robinhood has no per-order fee, so small orders are fine
     max_cost_to_stop: float = 0.35  # skip if round-trip spread eats >35% of the stop distance
     # "Hold until profitable": for these symbols a position is never sold below
@@ -107,27 +108,51 @@ def size_position(cfg: RiskConfig, equity: float, cash: float, exposure: float,
 
 @dataclass
 class CircuitBreaker:
+    """Tracks a deposit-adjusted performance index (starts at 1.0), so adding
+    money can't mask a losing stretch. Halts permanently (until a human resets
+    it) after the index falls `max_drawdown` below its peak; pauses new entries
+    after the index falls `max_daily_loss` below its level ~24h ago."""
+
     cfg: RiskConfig
-    peak_equity: float = 0.0
+    index: float = 1.0
+    peak: float = 1.0
+    last_equity: float = 0.0
+    last_contributed: float = 0.0
     day: int = -1
-    day_start_equity: float = 0.0
+    day_start_index: float = 1.0
+    prev_day_index: float = 1.0
     halted: bool = False
     halt_reason: str = ""
     events: list[str] = field(default_factory=list)
 
-    def update(self, ts: int, equity: float) -> None:
+    def update(self, ts: int, equity: float, contributed: float | None = None) -> None:
+        """`contributed` is the running total of deposits (None = no deposits)."""
+        flow = 0.0 if contributed is None else contributed - self.last_contributed
+        if self.last_equity > 0:
+            self.index *= (equity - flow) / self.last_equity
+        self.last_equity = equity
+        if contributed is not None:
+            self.last_contributed = contributed
         d = ts // 86400
         if d != self.day:
-            self.day, self.day_start_equity = d, equity
-        self.peak_equity = max(self.peak_equity, equity)
-        if not self.halted and self.peak_equity and equity < self.peak_equity * (1 - self.cfg.max_drawdown):
+            self.prev_day_index = self.day_start_index if self.day >= 0 else self.index
+            self.day, self.day_start_index = d, self.index
+        self.peak = max(self.peak, self.index)
+        if not self.halted and self.index < self.peak * (1 - self.cfg.max_drawdown):
             self.halted = True
-            self.halt_reason = f"drawdown {1 - equity / self.peak_equity:.1%} exceeded limit"
+            self.halt_reason = f"drawdown {1 - self.index / self.peak:.1%} exceeded limit"
             self.events.append(f"{ts}: HALT {self.halt_reason}")
 
-    def can_enter(self, equity: float) -> bool:
+    def can_enter(self) -> bool:
         if self.halted:
             return False
-        if self.day_start_equity and equity < self.day_start_equity * (1 - self.cfg.max_daily_loss):
-            return False
-        return True
+        ref = max(self.day_start_index, self.prev_day_index)
+        return self.index >= ref * (1 - self.cfg.max_daily_loss)
+
+    def reset(self) -> None:
+        self.halted, self.halt_reason, self.peak = False, "", self.index
+
+    def to_dict(self) -> dict:
+        return {k: getattr(self, k) for k in (
+            "index", "peak", "last_equity", "last_contributed", "day", "day_start_index",
+            "prev_day_index", "halted", "halt_reason")}

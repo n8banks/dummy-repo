@@ -117,7 +117,7 @@ def cmd_screen(args):
 def cmd_backtest(args):
     uni = _universe(args)
     costs = backtest.CostModel(spread_pct=args.spread, fee_pct=args.fee,
-                               per_symbol_spread=_spreads(args))
+                               per_symbol_spread=_spreads(args), stop_slippage=args.stop_slippage)
     res = backtest.run(_traded(uni, args), _builder(args)(uni), _risk(args), costs,
                        start_equity=0.0 if args.daily_budget else args.equity,
                        bars_per_year=_bars_per_year(args.interval),
@@ -149,7 +149,7 @@ def cmd_research(args):
         variants[name] = build(name, secs)
         variants[f"{name}+regime"] = build(name, secs, btc)
     rows = research.compare(_traded(uni, args), variants, args.spread, _bars_per_year(args.interval),
-                            _risk(args))
+                            _risk(args), args.stop_slippage)
     research.print_table(rows)
 
 
@@ -177,11 +177,14 @@ def _trader(args):
 
 
 def cmd_trade(args):
+    from .util import single_instance
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    lock = single_instance(DATA_DIR / "rhbot.lock")  # noqa: F841 (held until exit)
     trader = _trader(args)
     if args.reset_halt:
         # Clears the kill switch and restarts drawdown tracking from current equity.
-        trader.breaker.halted, trader.breaker.halt_reason, trader.breaker.peak_equity = False, "", 0.0
+        trader.breaker.reset()
         trader._save()
         logging.info("circuit breaker reset by operator")
     if args.once:
@@ -223,8 +226,11 @@ def main(argv=None):
                         help="never sell these below a small profit (tested: worse; see README)")
         sp.add_argument("--hold-floor", type=float, default=0.0,
                         help="with --hold-to-profit, still sell if down this much (0.4 = 40%%)")
-        sp.add_argument("--spread", type=float, default=0.008,
-                        help="assumed round-trip spread when no live quote (0.008 = 0.8%%)")
+        sp.add_argument("--spread", type=float, default=0.02,
+                        help="assumed round-trip cost when no live quote (0.02 = 2%%, Robinhood's "
+                             "measured cost at small size in 2026)")
+        sp.add_argument("--stop-slippage", type=float, default=0.005,
+                        help="backtest: extra loss when a stop-market order fills (0.005 = 0.5%%)")
         sp.add_argument("--fee", type=float, default=0.0, help="explicit per-side fee fraction")
         sp.add_argument("--equity", type=float, default=10_000.0)
         sp.add_argument("--synthetic", action="store_true", help="use generated data (offline)")

@@ -58,11 +58,12 @@ def curve_stats(curve: list[tuple[int, float]], bars_per_year: float) -> dict:
 
 
 def compare(universe: dict[str, list[Candle]], variants: dict[str, Callable[[], Strategy]],
-            spread: float, bars_per_year: float, risk: RiskConfig | None = None) -> list[dict]:
+            spread: float, bars_per_year: float, risk: RiskConfig | None = None,
+            stop_slippage: float = 0.005) -> list[dict]:
     risk = replace(risk or RiskConfig(), max_drawdown=0.999)  # observe, don't halt
     rows = []
     for name, factory in variants.items():
-        res = backtest.run(universe, factory, risk, backtest.CostModel(spread_pct=spread),
+        res = backtest.run(universe, factory, risk, backtest.CostModel(spread_pct=spread, stop_slippage=stop_slippage),
                            bars_per_year=bars_per_year)
         m = res.metrics()
         m["name"] = name
