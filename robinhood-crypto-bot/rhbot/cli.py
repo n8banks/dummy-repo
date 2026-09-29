@@ -70,6 +70,13 @@ def _spreads(args) -> dict[str, float]:
 
 def _builder(args):
     secs = INTERVALS[args.interval]
+    if args.strategy == "evolved":
+        from . import evolve
+
+        if args.interval != "1d":
+            sys.exit("evolved brains are trained on daily bars; use --interval 1d")
+        genome = evolve.load_genome(args.genome)
+        return lambda uni: evolve.make_factory(genome, uni)
     return lambda uni: build(args.strategy, secs, None if args.no_regime else uni.get("BTC-USD"))
 
 
@@ -153,6 +160,51 @@ def cmd_research(args):
     research.print_table(rows)
 
 
+def cmd_evolve(args):
+    """Evolve a neural policy with domain randomisation, then run the same
+    evolution on trend-scrambled data (null control) and test once on a
+    holdout. Saves the champion only with its verdict attached."""
+    import datetime as dt
+
+    from . import evolve
+
+    uni = _universe(args)
+    ts = lambda d: int(dt.datetime.fromisoformat(d).replace(tzinfo=dt.timezone.utc).timestamp())  # noqa: E731
+    start, split = ts(args.train_start), ts(args.holdout_start)
+    end = max(c.ts for cs in uni.values() for c in cs) + 1
+    trade = {s: uni[s] for s in args.symbols}
+
+    def train_fitness(genome, u):
+        tr = {s: [c for c in cs if c.ts < split] for s, cs in u.items()}
+        spec = evolve.EvalSpec(tr, evolve.feature_tables(tr), list(tr), args.spread, start)
+        return evolve.fitness_of(evolve.run_genome(genome, spec), genome)
+
+    print(f"evolving on {args.train_start}..{args.holdout_start}, holdout after; "
+          f"pop {args.pop}, {args.generations} generations")
+    champ, _ = evolve.evolve(trade, start, split, args.generations, args.pop, args.seed, args.workers)
+    real = train_fitness(champ, trade)
+    nulls = []
+    for k in range(args.null_runs):
+        fake = evolve.null_universe(trade, 1000 + k)
+        nc, _ = evolve.evolve(fake, start, split, args.generations, args.pop, 1000 + k, args.workers,
+                              log=lambda s: None)
+        nulls.append(train_fitness(nc, fake))
+        print(f"null run {k + 1}: champion fitness {nulls[-1]:+.4f}")
+    spec = evolve.EvalSpec(trade, evolve.feature_tables(trade), list(trade), args.spread, split)
+    hold = evolve.run_genome(champ, spec).metrics()
+    beats_null = real > max(nulls) if nulls else False
+    print(f"\nreal champion train fitness {real:+.4f}; best null {max(nulls) if nulls else float('nan'):+.4f}")
+    print(f"holdout: CAGR {hold['cagr']:+.1%}, Sharpe {hold['sharpe']:.2f}, max DD {hold['max_drawdown']:.1%}, "
+          f"trades {hold['trades']}")
+    verdict = "PASS" if beats_null and hold["cagr"] > 0 else "FAIL"
+    print(f"verdict: {verdict} (needs to beat every null champion AND be positive on the holdout)")
+    evolve.save(args.out, champ, {"train_fitness": real, "null_fitness": nulls,
+                                  "holdout": {k: hold[k] for k in ("cagr", "sharpe", "max_drawdown", "trades")},
+                                  "verdict": verdict, "train_start": args.train_start,
+                                  "holdout_start": args.holdout_start, "symbols": args.symbols})
+    print(f"saved to {args.out}")
+
+
 def _trader(args):
     from .broker import PaperBroker, RobinhoodBroker
     from .budget import Budget
@@ -178,6 +230,14 @@ def _trader(args):
 
 def cmd_trade(args):
     from .util import single_instance
+
+    if args.strategy == "evolved":
+        import json
+
+        meta = json.loads(Path(args.genome).read_text())
+        if meta.get("verdict") != "PASS":
+            sys.exit(f"{args.genome} failed its null/holdout test (verdict {meta.get('verdict')}); "
+                     "refusing to trade it")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     lock = single_instance(DATA_DIR / "rhbot.lock")  # noqa: F841 (held until exit)
@@ -216,7 +276,9 @@ def main(argv=None):
         sp.add_argument("--interval", default="1d", choices=list(INTERVALS),
                         help="bar size; real-data tests favour 1d (see README)")
         sp.add_argument("--bars", type=int, default=2000)
-        sp.add_argument("--strategy", default="tsmom", choices=list(STRATEGIES))
+        sp.add_argument("--strategy", default="tsmom", choices=list(STRATEGIES) + ["evolved"])
+        sp.add_argument("--genome", default=str(DATA_DIR / "evolved.json"),
+                        help="with --strategy evolved: the brain saved by `evolve`")
         sp.add_argument("--no-regime", action="store_true",
                         help="don't require BTC to be in an uptrend before buying")
         sp.add_argument("--max-loss", type=float, default=0.15,
@@ -247,6 +309,17 @@ def main(argv=None):
     sp.add_argument("--cash-apy", type=float, default=0.0,
                     help="interest earned on idle cash, e.g. 0.04 for a 4%% sweep rate")
     sp.set_defaults(fn=cmd_backtest)
+    sp = sub.add_parser("evolve", help="evolve a neural policy (with null-control test)")
+    common(sp)
+    sp.set_defaults(bars=3300, fn=cmd_evolve)
+    sp.add_argument("--generations", type=int, default=40)
+    sp.add_argument("--pop", type=int, default=48)
+    sp.add_argument("--seed", type=int, default=1)
+    sp.add_argument("--workers", type=int, default=4)
+    sp.add_argument("--null-runs", type=int, default=3)
+    sp.add_argument("--train-start", default="2018-01-01")
+    sp.add_argument("--holdout-start", default="2024-01-01")
+    sp.add_argument("--out", default=str(DATA_DIR / "evolved.json"))
     for name, fn in [("trade", cmd_trade), ("status", cmd_status)]:
         sp = sub.add_parser(name)
         common(sp)
