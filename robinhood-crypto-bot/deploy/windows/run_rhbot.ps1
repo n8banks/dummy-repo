@@ -23,6 +23,6 @@ New-Item -ItemType Directory -Force -Path $env:RHBOT_DATA | Out-Null
 
 while ($true) {
     # Paper trading. Add --live only after you trust the paper results.
-    .\.venv\Scripts\python -m rhbot trade --interval 1h --strategy trend *>> "$env:RHBOT_DATA\rhbot.log"
+    .\.venv\Scripts\python -m rhbot trade --interval 1d --strategy tsmom --daily-budget 25 --budget-cap 500 *>> "$env:RHBOT_DATA\rhbot.log"
     Start-Sleep -Seconds 30
 }

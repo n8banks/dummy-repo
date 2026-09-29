@@ -9,9 +9,7 @@ are set (real spreads), else Coinbase's ticker plus an assumed spread.
 from __future__ import annotations
 
 import json
-import math
 import time
-from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Protocol
@@ -20,12 +18,7 @@ import requests
 
 from .data import COINBASE
 from .robinhood import Quote, RobinhoodClient
-
-
-@dataclass
-class Holding:
-    symbol: str
-    qty: float
+from .util import write_json_atomic
 
 
 class Broker(Protocol):
@@ -35,6 +28,7 @@ class Broker(Protocol):
     def buy(self, symbol: str, qty: float, limit: float) -> dict: ...
     def sell(self, symbol: str, qty: float) -> dict: ...
     def set_stop(self, symbol: str, qty: float, stop: float) -> None: ...
+    def has_stop(self, symbol: str) -> bool: ...
     def cancel_stop(self, symbol: str) -> None: ...
     def cancel_open_entries(self) -> None: ...
 
@@ -64,8 +58,7 @@ class PaperBroker:
         self._last: dict[str, Quote] = {}
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.book, indent=2))
+        write_json_atomic(self.path, self.book)
 
     def quotes(self, symbols):
         q = self.rh.quotes(symbols) if self.rh else coinbase_quotes(symbols, self.assumed_spread)
@@ -104,6 +97,9 @@ class PaperBroker:
         # Paper stops are enforced by the trader loop each cycle.
         self.book["stops"][symbol] = stop
         self._save()
+
+    def has_stop(self, symbol):
+        return symbol in self.book["stops"]
 
     def cancel_stop(self, symbol):
         self.book["stops"].pop(symbol, None)
@@ -187,6 +183,9 @@ class RobinhoodBroker:
                                 stop_price=self._px(symbol, stop))
         self.stop_orders[symbol] = o["id"]
 
+    def has_stop(self, symbol):
+        return symbol in self.stop_orders
+
     def cancel_stop(self, symbol):
         oid = self.stop_orders.pop(symbol, None)
         if oid:
@@ -198,6 +197,3 @@ class RobinhoodBroker:
             if o.get("side") == "buy":
                 self.rh.cancel_order(o["id"])
 
-
-def is_dust(qty: float, price: float) -> bool:
-    return math.isclose(qty, 0.0) or qty * price < 1.0

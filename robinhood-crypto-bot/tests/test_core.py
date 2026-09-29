@@ -128,7 +128,7 @@ def test_trader_paper_cycle_enters_then_stops_out(tmp_path):
     candles = flat(60)
     quotes = {"X-USD": Quote("X-USD", 100, 99.99, 100.01)}
     broker = StubPaper(tmp_path, quotes)
-    tr = Trader(broker, ["X-USD"], AlwaysIn, RiskConfig(), "1h", tmp_path / "s.json",
+    tr = Trader(broker, ["X-USD"], lambda u: AlwaysIn, RiskConfig(), "1h", tmp_path / "s.json",
                 candle_source=lambda s, i, n: candles)
     now = 61 * 3600
     acts = tr.step(now)
@@ -149,7 +149,7 @@ def test_trader_respects_budget_and_leaves_user_coins(tmp_path):
     from rhbot.budget import Budget
 
     now = 61 * 3600
-    tr = Trader(broker, ["X-USD"], AlwaysIn, RiskConfig(), "1h", tmp_path / "s.json",
+    tr = Trader(broker, ["X-USD"], lambda u: AlwaysIn, RiskConfig(), "1h", tmp_path / "s.json",
                 budget=Budget(25, "1970-01-03"), candle_source=lambda s, i, n: candles)
     tr.step(now)
     pos = tr.state["positions"]["X-USD"]
@@ -157,3 +157,89 @@ def test_trader_respects_budget_and_leaves_user_coins(tmp_path):
     broker.fixed = {"X-USD": Quote("X-USD", 90, 89.99, 90.01)}
     tr.step(now + 3600)
     assert broker.holdings()["X-USD"] == pytest.approx(5.0)  # only the bot's slice was sold
+
+
+def test_budget_cap():
+    from rhbot.budget import Budget
+
+    b = Budget(25, "1970-01-01", cap=500)
+    assert b.contributed(19 * 86400) == 500
+    assert b.contributed(100 * 86400) == 500
+
+
+def test_resample_hourly_to_daily():
+    from rhbot.data import resample
+
+    hours = [Candle(i * 3600, 10 + i, 20 + i, 1 + i, 11 + i, 1) for i in range(50)]
+    days = resample(hours, 86400)
+    assert len(days) == 2  # hours 48-49 are an incomplete third day
+    d = days[1]
+    assert (d.ts, d.open, d.close) == (86400, 34, 58)
+    assert d.high == 20 + 47 and d.low == 1 + 24 and d.volume == 24
+
+
+def test_tsmom_hysteresis():
+    from rhbot.strategies import EXIT, TSMomentum
+
+    up = [Candle(i, p, p, p, p, 1) for i, p in enumerate(range(100, 130))]
+    s = TSMomentum(lookbacks=(2, 5, 10), enter_at=1.0, exit_at=0.0)
+    s.prepare(up)
+    assert s.signal(len(up) - 1, False, 0) == ENTER
+    down = up + [Candle(30 + i, p, p, p, p, 1) for i, p in enumerate(range(128, 110, -1))]
+    s.prepare(down)
+    assert s.signal(len(down) - 1, True, 5) == EXIT
+
+
+def test_regime_filter_blocks_entries_only():
+    from rhbot.strategies import EXIT, RegimeFilter
+
+    class Flip(Strategy):
+        def signal(self, i, in_position, bars_held):
+            return EXIT if in_position else ENTER
+
+    btc_down = [Candle(i, 100 - i, 100 - i, 100 - i, 100 - i, 1) for i in range(40)]
+    f = RegimeFilter(Flip(), btc_down, 10)
+    f.prepare(flat(40))
+    assert f.signal(30, False, 0) is None  # BTC below its EMA: no new buys
+    assert f.signal(30, True, 3) == EXIT   # but exits still go through
+
+
+def test_atomic_write_keeps_old_file_on_failure(tmp_path):
+    from rhbot.util import write_json_atomic
+
+    p = tmp_path / "s.json"
+    write_json_atomic(p, {"a": 1})
+    with pytest.raises(TypeError):
+        write_json_atomic(p, {"a": object()})
+    import json
+    assert json.loads(p.read_text()) == {"a": 1}
+    assert list(tmp_path.iterdir()) == [p]
+
+
+def test_check_stops_between_bars(tmp_path):
+    candles = flat(60)
+    broker = StubPaper(tmp_path, {"X-USD": Quote("X-USD", 100, 99.99, 100.01)})
+    tr = Trader(broker, ["X-USD"], lambda u: AlwaysIn, RiskConfig(), "1h", tmp_path / "s.json",
+                candle_source=lambda s, i, n: candles)
+    tr.step(61 * 3600)
+    assert tr.check_stops(61 * 3600 + 900) == []
+    stop = tr.state["positions"]["X-USD"]["stop"]
+    broker.fixed = {"X-USD": Quote("X-USD", stop, stop * 0.999, stop * 1.001)}
+    acts = tr.check_stops(61 * 3600 + 1800)
+    assert any("SELL" in a for a in acts) and not tr.state["positions"]
+
+
+def test_build_strategies_scale_with_interval():
+    from rhbot.strategies import build
+
+    daily = build("tsmom", 86400)()
+    hourly = build("tsmom", 3600)()
+    assert hourly.warmup - 1 == 24 * (daily.warmup - 1)
+    btc = flat(200)
+    assert build("trend", 86400, btc)().name == "trend+regime"
+
+
+def test_cash_apy_accrues_on_idle_cash():
+    res = backtest.run({"X-USD": flat(24 * 366)}, lambda: MeanReversion(), start_equity=1000,
+                       cash_apy=0.05)
+    assert res.equity_curve[-1][1] == pytest.approx(1050, rel=2e-3)

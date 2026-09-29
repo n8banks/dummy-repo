@@ -9,4 +9,4 @@ services:
     volumes:
       - ./data:/data        # paper book, positions, cached candles survive restarts
     # To go live, append --live here and set RHBOT_LIVE_ACK in .env:
-    command: ["trade", "--interval", "1h", "--strategy", "trend"]
+    command: ["trade", "--interval", "1d", "--strategy", "tsmom", "--daily-budget", "25", "--budget-cap", "500"]

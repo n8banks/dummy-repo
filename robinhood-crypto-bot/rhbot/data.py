@@ -19,6 +19,8 @@ import requests
 
 COINBASE = "https://api.exchange.coinbase.com"
 GRANULARITIES = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "6h": 21600, "1d": 86400}
+# Intervals Coinbase doesn't serve directly; built by resampling 1h candles.
+RESAMPLED = {"4h": 4 * 3600, "12h": 12 * 3600}
 
 
 @dataclass
@@ -55,6 +57,27 @@ def fetch_coinbase(symbol: str, interval: str = "1h", bars: int = 2000,
         end = start
         time.sleep(0.35)  # public endpoint allows ~3 req/s
     return sorted(out.values(), key=lambda c: c.ts)[-bars:]
+
+
+def resample(candles: list[Candle], seconds: int) -> list[Candle]:
+    """Aggregate candles into `seconds`-long bars aligned to UTC (e.g. 1h -> 4h
+    or 1d). A partial trailing bar is dropped."""
+    out: list[Candle] = []
+    bucket: list[Candle] = []
+    for c in candles:
+        if bucket and c.ts // seconds != bucket[0].ts // seconds:
+            out.append(_merge(bucket, seconds))
+            bucket = []
+        bucket.append(c)
+    step = candles[1].ts - candles[0].ts if len(candles) > 1 else seconds
+    if bucket and bucket[-1].ts + step >= (bucket[0].ts // seconds + 1) * seconds:
+        out.append(_merge(bucket, seconds))  # last bucket is complete
+    return out
+
+
+def _merge(b: list[Candle], seconds: int) -> Candle:
+    return Candle(b[0].ts // seconds * seconds, b[0].open, max(c.high for c in b),
+                  min(c.low for c in b), b[-1].close, sum(c.volume for c in b))
 
 
 def save_csv(candles: list[Candle], path: str | Path) -> None:

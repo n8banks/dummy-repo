@@ -10,6 +10,7 @@ nothing here can see the future.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from . import indicators as ind
 from .data import Candle
@@ -105,8 +106,89 @@ class MeanReversion(Strategy):
         return None
 
 
-STRATEGIES = {"trend": TrendBreakout, "meanrev": MeanReversion}
+@dataclass
+class TSMomentum(Strategy):
+    """Time-series momentum ensemble, the most consistently documented edge
+    in crypto: vote across several lookbacks (is price above where it was N
+    bars ago?) and hold while enough of them agree. Averaging lookbacks
+    avoids betting everything on one tuned window, and the gap between the
+    entry and exit thresholds (hysteresis) stops it flipping in and out and
+    paying the spread every time the score wobbles."""
+
+    lookbacks: tuple = (20, 60, 120, 240)
+    enter_at: float = 0.75   # fraction of lookbacks that must be up to buy
+    exit_at: float = 0.25    # sell once only this fraction (or fewer) are up
+    name: str = "tsmom"
+
+    @property
+    def warmup(self) -> int:  # type: ignore[override]
+        return max(self.lookbacks) + 1
+
+    def score(self, i: int) -> float:
+        c = self.closes
+        return sum(c[i] > c[i - n] for n in self.lookbacks) / len(self.lookbacks)
+
+    def signal(self, i, in_position, bars_held):
+        s = self.score(i)
+        if not in_position and s >= self.enter_at:
+            return ENTER
+        if in_position and s <= self.exit_at:
+            return EXIT
+        return None
 
 
-def make(name: str, **params) -> Strategy:
-    return STRATEGIES[name](**params)
+class RegimeFilter(Strategy):
+    """Wraps a strategy and blocks *entries* unless BTC closes above its
+    `period`-bar EMA at that time. Alts fall harder than BTC in bear markets,
+    so sitting out when BTC itself is below trend avoids most of the damage.
+    Exits are never blocked."""
+
+    def __init__(self, inner: Strategy, btc: list[Candle], period: int):
+        self.inner = inner
+        closes = [c.close for c in btc]
+        e = ind.ema(closes, period)
+        self.bull = {c.ts: (e[i] is not None and c.close > e[i]) for i, c in enumerate(btc)}
+        self.name = f"{inner.name}+regime"
+
+    @property
+    def warmup(self) -> int:  # type: ignore[override]
+        return self.inner.warmup
+
+    def prepare(self, candles):
+        self.inner.prepare(candles)
+        self.candles, self.closes, self.atr = candles, self.inner.closes, self.inner.atr
+
+    def signal(self, i, in_position, bars_held):
+        sig = self.inner.signal(i, in_position, bars_held)
+        if sig == ENTER and not self.bull.get(self.candles[i].ts, False):
+            return None
+        return sig
+
+
+STRATEGIES = {"trend": TrendBreakout, "meanrev": MeanReversion, "tsmom": TSMomentum}
+
+
+def build(name: str, bar_seconds: int, btc: list[Candle] | None = None,
+          regime_days: int = 100) -> Callable[[], Strategy]:
+    """Strategy factory with lookbacks expressed in days, so the same
+    strategy means the same thing on 1h, 4h or daily bars. With `btc`
+    candles, entries are gated by the BTC regime filter.
+
+    Defaults are the middle of the tested range, not the best backtest:
+    picking the top of a parameter grid mostly selects luck."""
+    per_day = max(1, 86400 // bar_seconds)
+    d = lambda days: max(2, int(days * per_day))  # noqa: E731
+    if name == "tsmom":
+        base = lambda: TSMomentum(lookbacks=(d(7), d(14), d(30), d(60), d(90)),  # noqa: E731
+                                  enter_at=0.8, exit_at=0.4)
+    elif name == "trend":
+        base = lambda: TrendBreakout(entry_n=d(20), exit_n=d(10), fast=d(20), slow=d(50))  # noqa: E731
+    elif name == "meanrev":
+        base = MeanReversion
+    else:
+        raise ValueError(f"unknown strategy {name!r}")
+    if btc is None:
+        return base
+    return lambda: RegimeFilter(base(), btc, d(regime_days))
+
+

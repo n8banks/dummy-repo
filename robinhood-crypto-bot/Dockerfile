@@ -7,4 +7,4 @@ RUN useradd --create-home bot && mkdir /data && chown bot /data
 USER bot
 ENV RHBOT_DATA=/data PYTHONUNBUFFERED=1
 ENTRYPOINT ["python", "-m", "rhbot"]
-CMD ["trade", "--interval", "1h", "--strategy", "trend"]
+CMD ["trade", "--interval", "1d", "--strategy", "tsmom", "--daily-budget", "25", "--budget-cap", "500"]

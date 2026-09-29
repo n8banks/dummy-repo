@@ -116,9 +116,11 @@ class Result:
 def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strategy],
         risk: RiskConfig | None = None, costs: CostModel | None = None,
         start_equity: float = 10_000.0, bars_per_year: float = 24 * 365,
-        daily_contribution: float = 0.0) -> Result:
+        daily_contribution: float = 0.0, cash_apy: float = 0.0) -> Result:
     """`daily_contribution` adds that much cash at the first bar of each UTC
-    day, like the live bot's daily allowance."""
+    day, like the live bot's daily allowance. `cash_apy` accrues interest on
+    uninvested cash daily (e.g. Robinhood Gold's sweep rate); it counts as
+    return, not as a deposit."""
     risk = risk or RiskConfig()
     costs = costs or CostModel()
     strats: dict[str, Strategy] = {}
@@ -157,7 +159,9 @@ def run(universe: dict[str, list[Candle]], strategy_factory: Callable[[], Strate
 
     for ts in timeline:
         flow = 0.0
-        if daily_contribution and ts // 86400 != day:
+        if ts // 86400 != day:
+            if day is not None and cash > 0:
+                cash *= (1 + cash_apy) ** ((ts // 86400 - day) / 365)
             day = ts // 86400
             cash += daily_contribution
             flow = daily_contribution

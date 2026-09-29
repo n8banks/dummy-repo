@@ -18,6 +18,7 @@ if [ ! -f /etc/rhbot.env ]; then
 RH_API_KEY=
 RH_PRIVATE_KEY=
 # RHBOT_LIVE_ACK=I understand this trades real money
+# RHBOT_NTFY_TOPIC=pick-a-long-random-name  (phone alerts via the ntfy app)
 EOF
   chmod 600 /etc/rhbot.env
   echo "Fill in /etc/rhbot.env, then: systemctl enable --now rhbot"

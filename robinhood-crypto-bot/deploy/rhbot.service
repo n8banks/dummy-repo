@@ -13,7 +13,7 @@ WorkingDirectory=/opt/rhbot
 EnvironmentFile=/etc/rhbot.env
 Environment=RHBOT_DATA=/var/lib/rhbot
 # Paper trading by default. Add --live only after weeks of paper results you trust.
-ExecStart=/opt/rhbot/.venv/bin/python -m rhbot trade --interval 1h --strategy trend
+ExecStart=/opt/rhbot/.venv/bin/python -m rhbot trade --interval 1d --strategy tsmom --daily-budget 25 --budget-cap 500
 Restart=always
 RestartSec=30
 # Hardening: the bot only needs outbound HTTPS and its own state dir.
